@@ -1,0 +1,175 @@
+---
+title: "TickerFunctionContext"
+description: "Runtime context passed to every TickerQ job handler containing job metadata and control operations."
+---
+
+`TickerFunctionContext` is the runtime context object injected as a parameter into every `[TickerFunction]`-annotated method. It exposes metadata about the current job execution and provides methods to influence execution behaviour.
+
+---
+
+## Class hierarchy
+
+```
+TickerFunctionContext
+└── TickerFunctionContext<TRequest>
+```
+
+- **`TickerFunctionContext`** — base context for all handlers.
+- **`TickerFunctionContext<TRequest>`** — extends the base with a typed `Request` property for handlers that receive a payload.
+
+---
+
+## TickerFunctionContext properties
+
+<ResponseField name="Id" type="Guid" required>
+  The unique identifier of the ticker record (time ticker or cron ticker occurrence) that triggered this execution.
+</ResponseField>
+
+<ResponseField name="Type" type="TickerType" required>
+  Indicates whether the job was triggered by a time-based ticker or a cron ticker occurrence.
+
+  | Value | Description |
+  |---|---|
+  | `TickerType.TimeTicker` | Triggered by a one-shot `TimeTicker` record. |
+  | `TickerType.CronTickerOccurrence` | Triggered by a scheduled cron occurrence. |
+</ResponseField>
+
+<ResponseField name="RetryCount" type="int" required>
+  The number of retry attempts that have occurred for this execution. `0` on the first attempt.
+</ResponseField>
+
+<ResponseField name="IsDue" type="bool" required>
+  `true` when the job's scheduled time has already passed at the moment of dispatch. Use this to detect late executions and decide whether to proceed or skip work.
+</ResponseField>
+
+<ResponseField name="ScheduledFor" type="DateTime" required>
+  The UTC timestamp when this job was originally scheduled to run. For time tickers, this is the `ExecutionTime` of the ticker record. For cron tickers, this is the `ExecutionTime` of the occurrence.
+</ResponseField>
+
+<ResponseField name="FunctionName" type="string" required>
+  The `functionName` value from the `[TickerFunction]` attribute that matched this execution.
+</ResponseField>
+
+<ResponseField name="CronOccurrenceOperations" type="CronOccurrenceOperations">
+  Provides cron-specific control operations. `null` when `Type` is `TickerType.TimeTicker`. See [CronOccurrenceOperations](#cronoccurrenceoperations) below.
+</ResponseField>
+
+---
+
+## TickerFunctionContext methods
+
+### RequestCancellation
+
+```csharp
+public void RequestCancellation()
+```
+
+Signals TickerQ to cancel the current job execution. Internally invokes the registered cancel operation action, which marks the job as cancelled in the persistence layer. Call this when your handler determines that execution should not proceed — for example, when a prerequisite check fails.
+
+---
+
+## TickerFunctionContext\<TRequest\>
+
+The generic variant adds a single read-only property:
+
+<ResponseField name="Request" type="TRequest" required>
+  The deserialized request payload that was attached to the ticker when it was scheduled. The type `TRequest` must be the same type used when the ticker was created. Deserialization uses the `JsonSerializerOptions` configured via `ConfigureRequestJsonOptions()` (or `System.Text.Json` defaults).
+</ResponseField>
+
+All base `TickerFunctionContext` properties and methods are available on `TickerFunctionContext<TRequest>` via inheritance.
+
+---
+
+## CronOccurrenceOperations
+
+`CronOccurrenceOperations` is exposed on `TickerFunctionContext.CronOccurrenceOperations` and is only populated for cron ticker executions.
+
+### SkipIfAlreadyRunning
+
+```csharp
+public void SkipIfAlreadyRunning()
+```
+
+Checks whether another instance of the same cron function is currently running. If one is, the current execution is skipped (marked as `Skipped` in the persistence layer) and the handler exits immediately. Use this as a lightweight guard when `maxConcurrency` is not set on the attribute and you want idempotent protection at the occurrence level.
+
+<Warning>
+  `CronOccurrenceOperations` is `null` for time ticker executions. Always check `context.Type` before calling `context.CronOccurrenceOperations.SkipIfAlreadyRunning()`, or use the generic guard shown in the example below.
+</Warning>
+
+---
+
+## Examples
+
+### Accessing job metadata
+
+```csharp
+[TickerFunction("AuditJob", "0 0 * * *")]
+public async Task AuditJob(TickerFunctionContext context)
+{
+    Console.WriteLine($"Job ID:        {context.Id}");
+    Console.WriteLine($"Type:          {context.Type}");
+    Console.WriteLine($"Retry:         {context.RetryCount}");
+    Console.WriteLine($"Scheduled for: {context.ScheduledFor:O}");
+    Console.WriteLine($"Is due:        {context.IsDue}");
+}
+```
+
+### Skipping stale executions
+
+```csharp
+[TickerFunction("PriceSync", "*/15 * * * *")]
+public async Task PriceSync(TickerFunctionContext context)
+{
+    if (context.IsDue && DateTime.UtcNow - context.ScheduledFor > TimeSpan.FromMinutes(5))
+    {
+        // Too late to be useful — cancel instead of running stale work.
+        context.RequestCancellation();
+        return;
+    }
+
+    // proceed with sync...
+}
+```
+
+### Handling a typed request payload
+
+```csharp
+[TickerFunction("SendEmail")]
+public async Task SendEmail(TickerFunctionContext<EmailRequest> context)
+{
+    var email = context.Request;
+    await _mailer.SendAsync(email.To, email.Subject, email.Body);
+}
+```
+
+### Using SkipIfAlreadyRunning on a cron handler
+
+```csharp
+[TickerFunction("HeavyReport", "0 * * * *")]
+public async Task HeavyReport(TickerFunctionContext context)
+{
+    if (context.Type == TickerType.CronTickerOccurrence)
+        context.CronOccurrenceOperations.SkipIfAlreadyRunning();
+
+    // Only one instance of HeavyReport will run at a time.
+    await GenerateReportAsync();
+}
+```
+
+### Cancelling programmatically
+
+```csharp
+[TickerFunction("ConditionalJob")]
+public async Task ConditionalJob(TickerFunctionContext context)
+{
+    var featureEnabled = await _featureFlags.IsEnabledAsync("ConditionalJob");
+
+    if (!featureEnabled)
+    {
+        context.RequestCancellation();
+        return;
+    }
+
+    // proceed...
+}
+```

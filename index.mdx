@@ -1,97 +1,114 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "TickerQ — Background Job Scheduler for .NET"
+description: "Fast, reflection-free background task scheduling with source generators, EF Core & Redis persistence, cron + time-based execution, and a real-time dashboard."
 ---
 
-## Setting up
+TickerQ is the modern background job scheduler for .NET. It uses Roslyn source generators to register job functions at compile time — no reflection, no magic strings, fully AOT and trimming compatible. Add jobs with a single attribute, persist them to your existing database, and monitor everything in real time.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get a working scheduler running in under 5 minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Core Concepts" icon="lightbulb" href="/concepts/ticker-functions">
+    Understand ticker functions, cron jobs, and time-based scheduling.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Persistence" icon="database" href="/persistence/ef-core">
+    Connect EF Core or Redis as your persistence backend.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/add-ticker-q">
+    Explore every public type, method, and configuration option.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why TickerQ?
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="Zero reflection, AOT ready" icon="bolt">
+    Source generators at compile time. No runtime reflection, no magic strings, fully trimmable.
+  </Card>
+  <Card title="Your database" icon="server">
+    EF Core (PostgreSQL, SQL Server, SQLite, MySQL) or Redis. No separate storage infrastructure.
+  </Card>
+  <Card title="Real-time dashboard" icon="chart-line">
+    Built-in SignalR dashboard to monitor, inspect, and manage jobs — no paid add-ons.
+  </Card>
+  <Card title="Multi-node ready" icon="network-wired">
+    Redis heartbeats, dead-node cleanup, and lock-based coordination. Just add instances.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Get started in three steps
 
-## Need inspiration?
+<Steps>
+  <Step title="Install TickerQ">
+    Add the core package and a persistence provider to your .NET project.
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+    ```bash
+    dotnet add package TickerQ
+    dotnet add package TickerQ.EntityFrameworkCore
+    ```
+  </Step>
+  <Step title="Register and define a job">
+    Wire up services and decorate any method with `[TickerFunction]`.
+
+    ```csharp Program.cs
+    builder.Services.AddTickerQ(options =>
+    {
+        options.AddOperationalStore(ef =>
+            ef.UseTickerQDbContext<TickerQDbContext>(db =>
+                db.UseSqlite("Data Source=tickerq.db")));
+    });
+
+    var app = builder.Build();
+    app.UseTickerQ();
+    ```
+
+    ```csharp Jobs.cs
+    public class MyJobs
+    {
+        [TickerFunction("SendWelcomeEmail")]
+        public async Task SendWelcomeEmail(
+            TickerFunctionContext context,
+            CancellationToken cancellationToken)
+        {
+            Console.WriteLine($"Job {context.Id} running at {context.ScheduledFor:O}");
+        }
+    }
+    ```
+  </Step>
+  <Step title="Schedule a job">
+    Use `ITimeTickerManager` to schedule a one-off job, or define a recurring cron expression directly on the attribute.
+
+    ```csharp
+    public class SchedulingService(ITimeTickerManager<TimeTickerEntity> manager)
+    {
+        public async Task ScheduleWelcomeEmail()
+        {
+            await manager.AddAsync(new TimeTickerEntity
+            {
+                Function = "SendWelcomeEmail",
+                ExecutionTime = DateTime.UtcNow.AddSeconds(10)
+            });
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+## Packages
+
+TickerQ is split into focused packages so you only take what you need.
+
+| Package | Purpose |
+|---|---|
+| `TickerQ` | Core scheduler engine and background services |
+| `TickerQ.Utilities` | Shared types, entities, interfaces, and attributes |
+| `TickerQ.EntityFrameworkCore` | EF Core persistence (PostgreSQL, SQL Server, SQLite, MySQL) |
+| `TickerQ.Caching.StackExchangeRedis` | Redis persistence and distributed coordination |
+| `TickerQ.Dashboard` | Real-time SignalR monitoring dashboard |
+| `TickerQ.Instrumentation.OpenTelemetry` | OpenTelemetry activity tracing |
+| `TickerQ.SourceGenerator` | Compile-time job function registration (included automatically) |
+
+<Note>
+  Always keep all TickerQ packages on the same version. They are versioned and released together.
+</Note>

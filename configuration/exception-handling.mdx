@@ -1,0 +1,192 @@
+---
+title: "Exception Handling"
+description: "Customize how TickerQ handles exceptions thrown by ticker functions."
+---
+
+When a ticker function throws an unhandled exception, TickerQ catches it and routes it through the configured exception handler. The default behavior is to log the exception via the standard `ILogger` infrastructure. You can replace this with a custom handler to add alerting, metrics, dead-letter storage, or any other fault-handling logic.
+
+## Default behavior
+
+Without a custom handler, exceptions are captured by `LoggerInstrumentation` and written to the host's logging pipeline at the `Error` level. The faulted job is marked with an appropriate failure status in the persistence layer, and execution continues for other jobs.
+
+Cancellation exceptions (for example, when the host is shutting down) follow a separate code path and are also logged at a lower severity.
+
+## The `ITickerExceptionHandler` interface
+
+Implement `ITickerExceptionHandler` from `TickerQ.Utilities.Interfaces`:
+
+```csharp
+public interface ITickerExceptionHandler
+{
+    Task HandleExceptionAsync(Exception exception, Guid tickerId, TickerType tickerType);
+    Task HandleCanceledExceptionAsync(Exception exception, Guid tickerId, TickerType tickerType);
+}
+```
+
+<ParamField path="HandleExceptionAsync" type="method">
+  Called when a ticker function throws any exception that is **not** a cancellation. Use this for alerting, retry scheduling, or dead-letter logging.
+
+  | Parameter | Type | Description |
+  |---|---|---|
+  | `exception` | `Exception` | The exception thrown by the ticker function. |
+  | `tickerId` | `Guid` | The ID of the time ticker or cron occurrence that faulted. |
+  | `tickerType` | `TickerType` | Either `TickerType.TimeTicker` or `TickerType.CronTickerOccurrence`. |
+</ParamField>
+
+<ParamField path="HandleCanceledExceptionAsync" type="method">
+  Called when a ticker function throws an `OperationCanceledException` (for example, because the host is shutting down or the job's own cancellation token was triggered). Implement this separately from the main error path to avoid generating false alerts on clean shutdowns.
+
+  | Parameter | Type | Description |
+  |---|---|---|
+  | `exception` | `Exception` | The cancellation exception. |
+  | `tickerId` | `Guid` | The ID of the ticker that was canceled. |
+  | `tickerType` | `TickerType` | Either `TickerType.TimeTicker` or `TickerType.CronTickerOccurrence`. |
+</ParamField>
+
+## Implementing a custom exception handler
+
+<Steps>
+
+<Step title="Create the handler class">
+
+Implement `ITickerExceptionHandler` in any class. The class is registered as a singleton, so inject only singleton or thread-safe dependencies.
+
+<CodeGroup>
+
+```csharp Handlers/MyExceptionHandler.cs
+using Microsoft.Extensions.Logging;
+using TickerQ.Utilities.Enums;
+using TickerQ.Utilities.Interfaces;
+
+public sealed class MyExceptionHandler : ITickerExceptionHandler
+{
+    private readonly ILogger<MyExceptionHandler> _logger;
+
+    public MyExceptionHandler(ILogger<MyExceptionHandler> logger)
+    {
+        _logger = logger;
+    }
+
+    public Task HandleExceptionAsync(
+        Exception exception,
+        Guid tickerId,
+        TickerType tickerType)
+    {
+        _logger.LogError(
+            exception,
+            "Ticker {TickerType} [{TickerId}] faulted.",
+            tickerType,
+            tickerId);
+
+        // Add alerting, metrics, dead-letter writes, etc.
+        return Task.CompletedTask;
+    }
+
+    public Task HandleCanceledExceptionAsync(
+        Exception exception,
+        Guid tickerId,
+        TickerType tickerType)
+    {
+        _logger.LogWarning(
+            "Ticker {TickerType} [{TickerId}] was canceled.",
+            tickerType,
+            tickerId);
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+</CodeGroup>
+
+</Step>
+
+<Step title="Register the handler">
+
+Call `SetExceptionHandler<THandler>()` on the `TickerOptionsBuilder` during service registration:
+
+<CodeGroup>
+
+```csharp Program.cs
+builder.Services.AddTickerQ(options =>
+{
+    options.AddOperationalStore(/* ... */);
+    options.SetExceptionHandler<MyExceptionHandler>();
+});
+```
+
+</CodeGroup>
+
+TickerQ registers `MyExceptionHandler` as a singleton implementation of `ITickerExceptionHandler`. Only one custom handler can be active at a time.
+
+</Step>
+
+</Steps>
+
+## Complete example
+
+The following handler sends a notification to an external alerting service on job failure, and silently ignores cancellations:
+
+<CodeGroup>
+
+```csharp Handlers/AlertingExceptionHandler.cs
+using TickerQ.Utilities.Enums;
+using TickerQ.Utilities.Interfaces;
+
+public sealed class AlertingExceptionHandler : ITickerExceptionHandler
+{
+    private readonly IAlertingService _alerting;
+    private readonly ILogger<AlertingExceptionHandler> _logger;
+
+    public AlertingExceptionHandler(
+        IAlertingService alerting,
+        ILogger<AlertingExceptionHandler> logger)
+    {
+        _alerting = alerting;
+        _logger = logger;
+    }
+
+    public async Task HandleExceptionAsync(
+        Exception exception,
+        Guid tickerId,
+        TickerType tickerType)
+    {
+        _logger.LogError(exception, "Job {TickerId} ({Type}) failed.", tickerId, tickerType);
+
+        await _alerting.SendAsync(new Alert
+        {
+            Title    = $"TickerQ job failed — {tickerType}",
+            Body     = exception.Message,
+            TickerId = tickerId
+        });
+    }
+
+    public Task HandleCanceledExceptionAsync(
+        Exception exception,
+        Guid tickerId,
+        TickerType tickerType)
+    {
+        // Cancellations on shutdown are expected — no alert needed.
+        return Task.CompletedTask;
+    }
+}
+```
+
+```csharp Program.cs
+builder.Services.AddTickerQ(options =>
+{
+    options.AddOperationalStore(efOptions =>
+    {
+        efOptions.UseTickerQDbContext<TickerQDbContext>(dbOptions =>
+            dbOptions.UseSqlite("Data Source=tickerq.db"));
+    });
+
+    options.SetExceptionHandler<AlertingExceptionHandler>();
+});
+```
+
+</CodeGroup>
+
+<Note>
+  `TickerType.TimeTicker` corresponds to one-off time-based jobs. `TickerType.CronTickerOccurrence` corresponds to a single occurrence of a recurring cron job. Both values come from `TickerQ.Utilities.Enums.TickerType`.
+</Note>

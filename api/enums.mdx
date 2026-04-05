@@ -1,0 +1,171 @@
+---
+title: "Enums"
+description: "Reference for all TickerQ enumerations used to configure and observe scheduled jobs."
+---
+
+## TickerStatus
+
+Represents the lifecycle state of a `TimeTickerEntity` or `CronTickerOccurrenceEntity`. TickerQ sets this field internally — do not assign it directly.
+
+<ResponseField name="Idle" type="0">
+  The ticker has been persisted but not yet picked up by the scheduler. This is the initial state after creation.
+</ResponseField>
+
+<ResponseField name="Queued" type="1">
+  The scheduler has acknowledged the ticker and placed it in the execution queue. It is waiting for an available worker.
+</ResponseField>
+
+<ResponseField name="InProgress" type="2">
+  A worker has claimed the ticker and is actively executing its handler function.
+</ResponseField>
+
+<ResponseField name="Done" type="3">
+  The job completed successfully within its scheduled execution window.
+</ResponseField>
+
+<ResponseField name="DueDone" type="4">
+  The job completed successfully, but its execution time had already passed when it was picked up (i.e., it ran late). The result is still considered a success.
+</ResponseField>
+
+<ResponseField name="Failed" type="5">
+  The handler threw an unhandled exception. If `Retries` is configured, TickerQ will retry up to the specified count before setting this status permanently.
+</ResponseField>
+
+<ResponseField name="Cancelled" type="6">
+  The job was cancelled before execution completed, either by a cancellation token or by the system shutting down.
+</ResponseField>
+
+<ResponseField name="Skipped" type="7">
+  The ticker was skipped because its `RunCondition` was not met based on the parent's terminal status.
+</ResponseField>
+
+**Typical lifecycle flow:**
+
+```
+Idle → Queued → InProgress → Done
+                           → DueDone
+                           → Failed (with retries if configured)
+                           → Cancelled
+                           → Skipped (child tickers only)
+```
+
+---
+
+## RunCondition
+
+Controls when a child `TimeTickerEntity` should execute relative to its parent's terminal status. Set this on child tickers in a job chain.
+
+<ResponseField name="OnSuccess" type="0">
+  Run only if the parent completed with status `Done` or `DueDone`. Equivalent to a "then" clause — proceed only when the parent succeeded.
+</ResponseField>
+
+<ResponseField name="OnFailure" type="1">
+  Run only if the parent reached `Failed` status. Use for error recovery or fallback logic.
+</ResponseField>
+
+<ResponseField name="OnCancelled" type="2">
+  Run only if the parent was `Cancelled`. Use for cleanup tasks that should fire when the user or system aborted the parent.
+</ResponseField>
+
+<ResponseField name="OnFailureOrCancelled" type="3">
+  Run if the parent reached either `Failed` or `Cancelled`. Combines the `OnFailure` and `OnCancelled` cases.
+</ResponseField>
+
+<ResponseField name="OnAnyCompletedStatus" type="4">
+  Run after the parent reaches any terminal status except `Skipped` — that is, `Done`, `DueDone`, `Failed`, or `Cancelled`. Provides "finally" semantics for cleanup that should always run.
+</ResponseField>
+
+<ResponseField name="InProgress" type="5">
+  Start executing in parallel with the parent, as soon as the parent transitions to `InProgress`. Use this for concurrent sibling work that should not wait for the parent to finish.
+</ResponseField>
+
+```csharp RunCondition example
+var parent = new TimeTickerEntity
+{
+    Function = "charge-payment",
+    ExecutionTime = DateTime.UtcNow.AddSeconds(5),
+    Children = new List<TimeTickerEntity>
+    {
+        new TimeTickerEntity
+        {
+            Function = "send-receipt",
+            RunCondition = RunCondition.OnSuccess
+        },
+        new TimeTickerEntity
+        {
+            Function = "notify-payment-failure",
+            RunCondition = RunCondition.OnFailure
+        },
+        new TimeTickerEntity
+        {
+            Function = "release-payment-lock",
+            RunCondition = RunCondition.OnAnyCompletedStatus
+        }
+    }
+};
+```
+
+---
+
+## TickerTaskPriority
+
+Controls the execution priority of a ticker's handler within TickerQ's internal task scheduler. Use this to tune throughput and resource allocation across different job types.
+
+<ResponseField name="LongRunning" type="0">
+  Executes the handler in a dedicated thread using the default .NET `TaskScheduler`. Suitable for CPU-intensive or blocking work that would otherwise tie up the shared thread pool. Use sparingly to avoid unbounded thread creation.
+</ResponseField>
+
+<ResponseField name="High" type="1">
+  Executes using TickerQ's internal `TickerTaskScheduler`. High-priority jobs are dequeued and started before `Normal` and `Low` jobs when multiple jobs are ready simultaneously.
+</ResponseField>
+
+<ResponseField name="Normal" type="2">
+  The default priority. Executes using TickerQ's internal `TickerTaskScheduler` after all `High`-priority jobs in the queue have been dispatched.
+</ResponseField>
+
+<ResponseField name="Low" type="3">
+  Executes using TickerQ's internal `TickerTaskScheduler` last, after both `High` and `Normal` jobs. Use for background maintenance work that should not compete with business-critical jobs.
+</ResponseField>
+
+<Note>
+  `TickerTaskPriority` is typically set when registering a ticker function handler, not on the entity itself.
+</Note>
+
+---
+
+## TickerType
+
+Identifies whether a ticker context refers to a one-shot time ticker or a cron ticker occurrence. Used internally by TickerQ when dispatching handlers.
+
+<ResponseField name="CronTickerOccurrence" type="0">
+  The ticker context represents a single occurrence generated by a `CronTickerEntity`.
+</ResponseField>
+
+<ResponseField name="TimeTicker" type="1">
+  The ticker context represents a `TimeTickerEntity` — a one-shot job scheduled for a specific time.
+</ResponseField>
+
+---
+
+## TickerQStartMode
+
+Controls when TickerQ begins processing jobs after the application starts. Configure this during setup via `UseTickerQ`.
+
+<ResponseField name="Immediate" type="0">
+  Background services are registered and job processing starts automatically as soon as `UseTickerQ` is called during application startup. This is the default behavior.
+</ResponseField>
+
+<ResponseField name="Manual" type="1">
+  Background services are registered but job processing is paused at startup. You must explicitly start the scheduler by calling `ITickerQHostScheduler` to begin processing jobs. Use this when you need to perform initialization steps before jobs can run.
+</ResponseField>
+
+```csharp TickerQStartMode configuration
+// Immediate (default) — starts processing on app startup
+app.UseTickerQ();
+// equivalent to:
+app.UseTickerQ(TickerQStartMode.Immediate);
+
+// Manual — scheduler registered but skips first run
+app.UseTickerQ(TickerQStartMode.Manual);
+// Resolve ITickerQHostScheduler to start processing when ready
+```

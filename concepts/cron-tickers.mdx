@@ -1,0 +1,192 @@
+---
+title: "Cron Tickers"
+description: "Recurring jobs defined by a cron expression. TickerQ generates occurrences automatically and tracks each run independently."
+---
+
+A cron ticker is a recurring job driven by a cron expression. TickerQ evaluates the expression, generates upcoming `CronTickerOccurrenceEntity` records, and dispatches them like any other job. Each occurrence is tracked independently, so you get a full history of every run.
+
+## Two ways to define a cron ticker
+
+<Tabs>
+  <Tab title="Attribute (compile-time)">
+    Pass a `cronExpression` to `[TickerFunction]`. TickerQ seeds the cron ticker in the database on startup.
+
+    ```csharp title="Jobs.cs"
+    public class ReportJobs
+    {
+        // Every day at 08:00
+        [TickerFunction("DailyReport", cronExpression: "0 8 * * *")]
+        public async Task SendDailyReportAsync(
+            TickerFunctionContext context,
+            CancellationToken cancellationToken)
+        {
+            await BuildAndSendReportAsync(cancellationToken);
+        }
+    }
+    ```
+
+    <Note>
+      A cron ticker seeded via the attribute is created once on first startup and updated on subsequent restarts if the expression changes. Use `IgnoreSeedDefinedCronTickers()` on the options builder to opt out of automatic seeding.
+    </Note>
+  </Tab>
+  <Tab title="ICronTickerManager (runtime)">
+    Inject `ICronTickerManager<CronTickerEntity>` to create cron tickers programmatically at runtime.
+
+    ```csharp title="Program.cs"
+    app.MapPost("/schedule-cron", async (
+        ICronTickerManager<CronTickerEntity> manager) =>
+    {
+        var result = await manager.AddAsync(new CronTickerEntity
+        {
+            Function   = "SyncInventory",
+            Expression = "*/15 * * * *",   // every 15 minutes
+            IsEnabled  = true
+        });
+
+        return Results.Ok(result.Result.Id);
+    });
+    ```
+  </Tab>
+</Tabs>
+
+## `CronTickerEntity` fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Id` | `Guid` | auto | Unique identifier. |
+| `Function` | `string` | required | Name of the ticker function to invoke. |
+| `Description` | `string` | `null` | Optional free-text label. |
+| `Expression` | `string` | required | Standard five-field cron expression (minute hour day-of-month month day-of-week). |
+| `Request` | `byte[]` | `null` | Serialized payload forwarded to every occurrence. See [Request Payloads](/concepts/request-payloads). |
+| `Retries` | `int` | `0` | Retry attempts per occurrence on failure. |
+| `RetryIntervals` | `int[]` | `null` | Seconds between retries. If shorter than `Retries`, the last value is reused. |
+| `IsEnabled` | `bool` | `true` | When `false`, no new occurrences are generated and pending ones are skipped. |
+| `CreatedAt` | `DateTime` | auto | UTC creation timestamp. |
+| `UpdatedAt` | `DateTime` | auto | UTC last-update timestamp. |
+
+## Cron expression syntax
+
+TickerQ uses standard five-field cron notation:
+
+```
+┌─ minute      (0–59)
+│ ┌─ hour        (0–23)
+│ │ ┌─ day of month (1–31)
+│ │ │ ┌─ month       (1–12)
+│ │ │ │ ┌─ day of week  (0–7, 0 and 7 = Sunday)
+│ │ │ │ │
+* * * * *
+```
+
+| Expression | Schedule |
+|---|---|
+| `* * * * *` | Every minute |
+| `0 * * * *` | Every hour (at :00) |
+| `0 8 * * *` | Every day at 08:00 |
+| `0 8 * * 1` | Every Monday at 08:00 |
+| `0 0 1 * *` | First day of every month at midnight |
+| `*/15 * * * *` | Every 15 minutes |
+| `0 9-17 * * 1-5` | Every hour from 09:00–17:00, weekdays only |
+
+## Occurrences
+
+Each time a cron expression fires, TickerQ creates a `CronTickerOccurrenceEntity` record. This is the actual unit of work — it has its own `Status`, `ExecutionTime`, and result fields.
+
+### `CronTickerOccurrenceEntity` fields
+
+| Field | Type | Description |
+|---|---|---|
+| `Id` | `Guid` | Unique occurrence identifier. |
+| `CronTickerId` | `Guid` | Foreign key back to the parent `CronTickerEntity`. |
+| `ExecutionTime` | `DateTime` | UTC time this occurrence is scheduled to run. |
+| `Status` | `TickerStatus` | Lifecycle state (`Idle` → `InProgress` → `Done` / `Failed` / etc.). |
+| `LockHolder` | `string` | Node identifier of the executing worker. |
+| `LockedAt` | `DateTime?` | When the occurrence was claimed. |
+| `ExecutedAt` | `DateTime?` | When execution completed. |
+| `ElapsedTime` | `long` | Execution time in milliseconds. |
+| `RetryCount` | `int` | Number of retries attempted for this occurrence. |
+| `ExceptionMessage` | `string` | Last exception message if the occurrence failed. |
+| `SkippedReason` | `string` | Why the occurrence was skipped. |
+
+### Skipping if already running
+
+Inside a ticker function, call `context.CronOccurrenceOperations.SkipIfAlreadyRunning()` to drop the current occurrence if a previous one is still in progress:
+
+```csharp title="Jobs.cs — skip overlapping runs"
+[TickerFunction("SyncOrders", cronExpression: "* * * * *")]
+public async Task SyncOrdersAsync(TickerFunctionContext context, CancellationToken cancellationToken)
+{
+    context.CronOccurrenceOperations.SkipIfAlreadyRunning();
+
+    await DoLongSyncAsync(cancellationToken);
+}
+```
+
+## Enabling and disabling cron tickers
+
+Set `IsEnabled = false` to pause a cron ticker without deleting it. TickerQ stops generating new occurrences, and any already-queued occurrences are skipped.
+
+```csharp title="Disable a cron ticker"
+var ticker = existingCronTicker;
+ticker.IsEnabled = false;
+await manager.UpdateAsync(ticker);
+```
+
+Re-enable it by setting `IsEnabled = true` and calling `UpdateAsync` again.
+
+## Skipping stale occurrences on startup
+
+If your application restarts after downtime, TickerQ may find `Idle` or `Queued` occurrences whose scheduled time has already passed. Enable `SkipStaleCronOccurrencesOnStartup` to mark those as `Skipped` instead of executing them:
+
+```csharp title="Program.cs"
+builder.Services.AddTickerQ(options =>
+{
+    options.SkipStaleCronOccurrencesOnStartup(threshold: TimeSpan.FromSeconds(30));
+});
+```
+
+Occurrences that are within `threshold` of the current time are still run normally. The default threshold when calling the method without arguments is 5 seconds.
+
+## `ICronTickerManager` CRUD operations
+
+`ICronTickerManager<TCronTicker>` mirrors the time ticker manager API:
+
+```csharp title="Cron ticker management"
+// Create
+var result = await manager.AddAsync(new CronTickerEntity
+{
+    Function   = "GenerateInvoices",
+    Expression = "0 0 1 * *",
+    Retries    = 2,
+    RetryIntervals = [60, 300]
+});
+
+// Update expression
+var ticker = result.Result;
+ticker.Expression = "0 0 15 * *";   // now runs on the 15th instead
+await manager.UpdateAsync(ticker);
+
+// Delete
+await manager.DeleteAsync(ticker.Id);
+```
+
+### Batch operations
+
+```csharp title="Batch create cron tickers"
+var tickers = new List<CronTickerEntity>
+{
+    new() { Function = "JobA", Expression = "0 6 * * *" },
+    new() { Function = "JobB", Expression = "0 18 * * *" }
+};
+
+await manager.AddBatchAsync(tickers);
+```
+
+| Method | Signature |
+|---|---|
+| `AddAsync` | `Task<TickerResult<TCronTicker>> AddAsync(TCronTicker, CancellationToken)` |
+| `UpdateAsync` | `Task<TickerResult<TCronTicker>> UpdateAsync(TCronTicker, CancellationToken)` |
+| `DeleteAsync` | `Task<TickerResult<TCronTicker>> DeleteAsync(Guid, CancellationToken)` |
+| `AddBatchAsync` | `Task<TickerResult<List<TCronTicker>>> AddBatchAsync(List<TCronTicker>, CancellationToken)` |
+| `UpdateBatchAsync` | `Task<TickerResult<List<TCronTicker>>> UpdateBatchAsync(List<TCronTicker>, CancellationToken)` |
+| `DeleteBatchAsync` | `Task<TickerResult<TCronTicker>> DeleteBatchAsync(List<Guid>, CancellationToken)` |

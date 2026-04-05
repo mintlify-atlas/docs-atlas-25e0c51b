@@ -1,0 +1,164 @@
+---
+title: "Scheduler Options"
+description: "Configure TickerQ's scheduler behavior, concurrency, polling, and start mode."
+---
+
+TickerQ exposes all scheduler settings through `SchedulerOptionsBuilder`, which you configure inside the `ConfigureScheduler()` call during service registration.
+
+## Configuring the scheduler
+
+Pass a delegate to `ConfigureScheduler()` on the `TickerOptionsBuilder` instance provided to `AddTickerQ`:
+
+<CodeGroup>
+
+```csharp Program.cs
+builder.Services.AddTickerQ(options =>
+{
+    options.ConfigureScheduler(scheduler =>
+    {
+        scheduler.MaxConcurrency = 8;
+        scheduler.IdleWorkerTimeOut = TimeSpan.FromMinutes(2);
+        scheduler.FallbackIntervalChecker = TimeSpan.FromSeconds(15);
+        scheduler.MinPollingInterval = TimeSpan.FromSeconds(2);
+        scheduler.NodeIdentifier = "api-node-1";
+        scheduler.SchedulerTimeZone = TimeZoneInfo.Utc;
+    });
+});
+```
+
+</CodeGroup>
+
+## Properties
+
+<ParamField path="NodeIdentifier" type="string" default="Environment.MachineName">
+  A string that uniquely identifies this scheduler instance in a multi-node deployment. Each node must use a distinct value so the persistence layer can attribute job ownership correctly. Defaults to the machine's hostname.
+
+  <Tip>Set this explicitly in containerized environments where `Environment.MachineName` may not be stable across restarts.</Tip>
+</ParamField>
+
+<ParamField path="MaxConcurrency" type="int" default="Environment.ProcessorCount">
+  The maximum number of jobs that can execute simultaneously on this node. The underlying `TickerQTaskScheduler` is initialized with this value and enforces the cap via a dedicated thread pool.
+</ParamField>
+
+<ParamField path="IdleWorkerTimeOut" type="TimeSpan" default="TimeSpan.FromMinutes(1)">
+  How long an idle worker thread is kept alive before it is released back to the OS. Reducing this value lowers memory usage during quiet periods; increasing it reduces thread-creation overhead during bursty workloads.
+</ParamField>
+
+<ParamField path="FallbackIntervalChecker" type="TimeSpan" default="TimeSpan.FromSeconds(30)">
+  The interval at which the `TickerQFallbackBackgroundService` scans for jobs that were missed — for example, because the scheduler restarted while a job was queued. Reduce this value if you need faster recovery from missed executions.
+</ParamField>
+
+<ParamField path="MinPollingInterval" type="TimeSpan" default="TimeSpan.FromSeconds(1)">
+  The minimum time between consecutive database polls. Acts as a rate limiter to prevent tight loops when many jobs become due simultaneously or when the job store is empty. See [performance tuning](#performance-tuning) below.
+</ParamField>
+
+<ParamField path="SchedulerTimeZone" type="TimeZoneInfo" default="TimeZoneInfo.Local">
+  The time zone used to evaluate cron expressions. Set this to `TimeZoneInfo.Utc` for consistent behavior across nodes in different geographic regions.
+</ParamField>
+
+## Skipping stale cron occurrences on startup
+
+When a node restarts after a period of downtime, cron occurrences that were never executed remain in an `Idle` or `Queued` state. By default, TickerQ picks these up and runs them. To mark stale occurrences as `Skipped` instead, call `SkipStaleCronOccurrencesOnStartup()`:
+
+<CodeGroup>
+
+```csharp Program.cs — skip occurrences older than 10 seconds
+builder.Services.AddTickerQ(options =>
+{
+    // Occurrences whose ExecutionTime is more than 10 seconds in the past
+    // at startup are marked Skipped rather than executed.
+    options.SkipStaleCronOccurrencesOnStartup(TimeSpan.FromSeconds(10));
+});
+```
+
+```csharp Program.cs — use the default 5-second threshold
+builder.Services.AddTickerQ(options =>
+{
+    // Defaults to 5 seconds when no threshold is specified.
+    options.SkipStaleCronOccurrencesOnStartup();
+});
+```
+
+</CodeGroup>
+
+<Note>
+  The `StaleCronOccurrenceThreshold` property on `SchedulerOptionsBuilder` defaults to `TimeSpan.Zero`, which disables stale-skipping entirely. Calling `SkipStaleCronOccurrencesOnStartup()` sets it to the provided threshold (or 5 seconds if none is given).
+</Note>
+
+## Performance tuning
+
+`MinPollingInterval` is the primary knob for tuning database load vs. scheduling latency.
+
+<AccordionGroup>
+  <Accordion title="Lowering the interval">
+    Setting `MinPollingInterval` below 1 second lets TickerQ react faster to newly scheduled jobs, but increases the number of queries issued to the persistence layer. Use sub-second values only if your database can sustain the load and your workload requires near-real-time scheduling precision.
+  </Accordion>
+  <Accordion title="Raising the interval">
+    Increasing `MinPollingInterval` (for example, to `TimeSpan.FromSeconds(5)`) reduces database chatter significantly for workloads where jobs are scheduled minutes or hours apart. Pair this with a tighter `FallbackIntervalChecker` if you still need prompt recovery from missed jobs.
+  </Accordion>
+  <Accordion title="In-memory persistence">
+    When using the default in-memory persistence provider, `MinPollingInterval` still applies but has no database cost. You can set it to `TimeSpan.Zero` safely in development.
+  </Accordion>
+</AccordionGroup>
+
+## Queue-only mode
+
+Call `DisableBackgroundServices()` when you want to enqueue jobs from this process but have the actual processing happen elsewhere (for example, a separate Worker Service):
+
+<CodeGroup>
+
+```csharp Program.cs — queue-only process
+builder.Services.AddTickerQ(options =>
+{
+    options.AddOperationalStore(/* ... */);
+    options.DisableBackgroundServices();
+});
+```
+
+</CodeGroup>
+
+When `DisableBackgroundServices()` is called:
+
+- `TickerQSchedulerBackgroundService` and `TickerQFallbackBackgroundService` are **not** registered.
+- `ITimeTickerManager` and `ICronTickerManager` **are** registered and fully functional.
+- No-op implementations of `ITickerQHostScheduler` and `ITickerQDispatcher` are used in place of the real ones.
+
+<Warning>
+  Do not call `UseTickerQ()` on a process that has `DisableBackgroundServices()` active — the scheduler background service will not be present and job processing will not start.
+</Warning>
+
+## Start modes
+
+`TickerQStartMode` controls whether job processing begins as soon as `UseTickerQ()` is called, or waits for an explicit trigger.
+
+<ParamField path="TickerQStartMode.Immediate" type="enum">
+  Job processing starts immediately when `UseTickerQ()` is called. This is the default.
+</ParamField>
+
+<ParamField path="TickerQStartMode.Manual" type="enum">
+  Background services are registered but the scheduler skips its first run. Call `ITickerQHostScheduler` methods manually to start processing when you are ready.
+</ParamField>
+
+Pass the desired mode to `UseTickerQ()`:
+
+<CodeGroup>
+
+```csharp Program.cs — immediate (default)
+app.UseTickerQ();
+// equivalent to:
+app.UseTickerQ(TickerQStartMode.Immediate);
+```
+
+```csharp Program.cs — manual start
+app.UseTickerQ(TickerQStartMode.Manual);
+
+// Later, when you are ready to process:
+var scheduler = app.Services.GetRequiredService<ITickerQHostScheduler>();
+// start via scheduler interface
+```
+
+</CodeGroup>
+
+<Note>
+  `UseTickerQ()` also signals `TickerQInitializerHostedService` to perform startup I/O (function discovery, database seeding, external provider initialization) when the host starts. Design-time tools that build the host without starting it — such as EF Core migration tools — will not trigger these operations.
+</Note>

@@ -1,0 +1,196 @@
+---
+title: "EF Core"
+description: "Persist TickerQ jobs in your existing database using Entity Framework Core."
+---
+
+TickerQ's EF Core integration stores jobs and cron schedules in your existing relational database. No separate storage service is required — TickerQ maps its tables into whichever database your application already uses.
+
+## Installation
+
+```bash
+dotnet add package TickerQ.EntityFrameworkCore
+```
+
+## Setup modes
+
+TickerQ offers two ways to wire up EF Core. Choose the one that fits your project.
+
+<Tabs>
+  <Tab title="UseTickerQDbContext (recommended)">
+    `UseTickerQDbContext` creates a **dedicated** `TickerQDbContext` that TickerQ manages independently. This is the recommended approach for new projects and for keeping job storage separate from your application's domain model.
+
+    TickerQ uses a `PooledDbContextFactory` internally (default pool size: 1024), so it never touches your application's `DbContext` or its lifetime.
+
+    <Steps>
+      <Step title="Register TickerQ with EF Core">
+        Call `AddOperationalStore` inside `AddTickerQ` and point `UseTickerQDbContext` at the built-in `TickerQDbContext`:
+
+        <CodeGroup>
+
+        ```csharp Program.cs (PostgreSQL)
+        using Npgsql.EntityFrameworkCore.PostgreSQL;
+        using TickerQ.DependencyInjection;
+        using TickerQ.EntityFrameworkCore.DbContextFactory;
+        using TickerQ.EntityFrameworkCore.DependencyInjection;
+
+        builder.Services.AddTickerQ(options =>
+        {
+            options.AddOperationalStore(efOptions =>
+            {
+                efOptions.UseTickerQDbContext<TickerQDbContext>(dbOptions =>
+                {
+                    dbOptions.UseNpgsql(
+                        "Host=localhost;Database=myapp;Username=postgres;Password=secret",
+                        b => b.MigrationsAssembly("MyApp.Api"));
+                });
+            });
+        });
+        ```
+
+        ```csharp Program.cs (SQL Server)
+        using Microsoft.EntityFrameworkCore;
+        using TickerQ.DependencyInjection;
+        using TickerQ.EntityFrameworkCore.DbContextFactory;
+        using TickerQ.EntityFrameworkCore.DependencyInjection;
+
+        builder.Services.AddTickerQ(options =>
+        {
+            options.AddOperationalStore(efOptions =>
+            {
+                efOptions.UseTickerQDbContext<TickerQDbContext>(dbOptions =>
+                {
+                    dbOptions.UseSqlServer(
+                        "Server=localhost;Database=myapp;Trusted_Connection=True;",
+                        b => b.MigrationsAssembly("MyApp.Api"));
+                });
+            });
+        });
+        ```
+
+        ```csharp Program.cs (SQLite)
+        using Microsoft.EntityFrameworkCore;
+        using TickerQ.DependencyInjection;
+        using TickerQ.EntityFrameworkCore.DbContextFactory;
+        using TickerQ.EntityFrameworkCore.DependencyInjection;
+
+        builder.Services.AddTickerQ(options =>
+        {
+            options.AddOperationalStore(efOptions =>
+            {
+                efOptions.UseTickerQDbContext<TickerQDbContext>(dbOptions =>
+                {
+                    dbOptions.UseSqlite(
+                        "Data Source=tickerq.db",
+                        b => b.MigrationsAssembly("MyApp.Api"));
+                });
+            });
+        });
+        ```
+
+        </CodeGroup>
+      </Step>
+
+      <Step title="Create the EF migration">
+        Run the EF CLI tool to generate the initial migration. The migration targets `TickerQDbContext`, not your application's `DbContext`:
+
+        ```bash
+        dotnet ef migrations add InitTickerQ \
+          --context TickerQDbContext \
+          --project MyApp.Api
+        ```
+      </Step>
+
+      <Step title="Apply the migration on startup">
+        Resolve `TickerQDbContext` from the DI container and call `Migrate()` before the app starts handling requests:
+
+        ```csharp Program.cs
+        var app = builder.Build();
+
+        using (var scope = app.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<TickerQDbContext>();
+            db.Database.Migrate();
+        }
+
+        app.UseTickerQ();
+        app.Run();
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="UseApplicationDbContext (existing DbContext)">
+    `UseApplicationDbContext` injects TickerQ's tables into your **existing** `DbContext`. Use this when you want all tables in a single context or when your migrations pipeline is already established.
+
+    Pass a `ConfigurationType` value to control how TickerQ adds its entity mappings:
+
+    | Value | Behaviour |
+    |---|---|
+    | `ConfigurationType.UseModelCustomizer` | TickerQ replaces EF Core's `IModelCustomizer` service to inject its table configurations automatically. Use this when you do **not** want to touch your `OnModelCreating`. |
+    | `ConfigurationType.IgnoreModelCustomizer` | TickerQ skips the model customizer. You must call the TickerQ configuration methods manually inside your `DbContext.OnModelCreating`. |
+
+    <Steps>
+      <Step title="Register TickerQ against your DbContext">
+        ```csharp Program.cs
+        using TickerQ.DependencyInjection;
+        using TickerQ.EntityFrameworkCore.Customizer;
+        using TickerQ.EntityFrameworkCore.DependencyInjection;
+
+        builder.Services.AddTickerQ(options =>
+        {
+            options.AddOperationalStore(efOptions =>
+            {
+                efOptions.UseApplicationDbContext<ApplicationDbContext>(
+                    ConfigurationType.UseModelCustomizer);
+            });
+        });
+        ```
+      </Step>
+
+      <Step title="Create and apply migrations">
+        Because the tables land in your existing `DbContext`, use your normal migration workflow:
+
+        ```bash
+        dotnet ef migrations add AddTickerQTables --context ApplicationDbContext
+        dotnet ef database update
+        ```
+      </Step>
+    </Steps>
+
+    <Note>
+      `UseApplicationDbContext` with `ConfigurationType.UseModelCustomizer` replaces EF Core's `IModelCustomizer` service for the specified `DbContext`. If you already have a custom model customizer, use `ConfigurationType.IgnoreModelCustomizer` and apply TickerQ's configurations manually.
+    </Note>
+  </Tab>
+</Tabs>
+
+## Options
+
+Configure the EF Core integration inside the `AddOperationalStore` callback using the `TickerQEfCoreOptionBuilder`:
+
+### `SetDbContextPoolSize`
+
+Sets the size of the internal `PooledDbContextFactory`. Defaults to `1024`.
+
+```csharp Program.cs
+efOptions.UseTickerQDbContext<TickerQDbContext>(dbOptions => { /* ... */ })
+         .SetDbContextPoolSize(512);
+```
+
+### `SetSchema`
+
+Sets the database schema for all TickerQ tables. Defaults to `"ticker"`.
+
+```csharp Program.cs
+efOptions.UseTickerQDbContext<TickerQDbContext>(dbOptions => { /* ... */ })
+         .SetSchema("jobs");
+```
+
+<Tip>
+  SQLite does not support schemas. Omit `SetSchema` or leave it at the default when targeting SQLite — the value is ignored for schema-less providers.
+</Tip>
+
+## Dead-node resource release
+
+When the application starts, TickerQ automatically scans for jobs that were locked by a previous instance (a "dead node") and releases them back into the queue. This happens before the scheduler begins processing, so no jobs are permanently lost after a crash or restart.
+
+The cleanup is triggered via `IInternalTickerManager.ReleaseDeadNodeResources` and runs inside an `ApplicationStarted` callback registered by `AddOperationalStore`.

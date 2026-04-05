@@ -1,0 +1,274 @@
+---
+title: "TickerQ Hub"
+description: "Connect your applications to TickerQ Hub — a centralized hosted scheduling service at hub.tickerq.net — using the .NET SDK or Node.js SDK."
+---
+
+[TickerQ Hub](https://hub.tickerq.net) is a centralized, hosted scheduling service. Instead of every application running its own scheduler, you register your applications as **nodes** with the Hub and let it dispatch job executions to them over HTTP.
+
+## Hub vs local scheduling
+
+<CardGroup cols={2}>
+  <Card title="Local scheduling" icon="server">
+    Each application runs its own TickerQ instance. Jobs are stored in a local database and executed in-process. Best when jobs are tightly coupled to a single application.
+  </Card>
+  <Card title="Hub scheduling" icon="cloud">
+    The Hub holds the schedule. Your applications register their functions and receive execution callbacks. Best when you want a single place to create, monitor, and manage jobs across multiple applications or languages.
+  </Card>
+</CardGroup>
+
+Use the Hub when:
+
+- You need to schedule jobs across services written in different languages (.NET, Node.js, etc.).
+- You want one dashboard for all scheduled work across your entire system.
+- You prefer not to manage a persistence backend (database, Redis) yourself.
+
+Use local scheduling when:
+
+- Jobs must run even when the Hub is unreachable.
+- You need full control over persistence, retry logic, and concurrency.
+- Your jobs contain data too sensitive to route through an external service.
+
+## Connecting a .NET application
+
+The .NET integration has two packages depending on your role:
+
+| Package | Role |
+|---|---|
+| `TickerQ.SDK` | **Scheduler node** — the application manages its own job queue but delegates scheduling decisions to the Hub |
+| `TickerQ.RemoteExecutor` | **Executor node** — the application only executes jobs; the Hub (or another scheduler) owns the queue |
+
+### Using TickerQ.SDK
+
+<Steps>
+  <Step title="Install the package">
+    ```bash terminal
+    dotnet add package TickerQ.SDK
+    ```
+  </Step>
+
+  <Step title="Register the SDK">
+    Call `AddTickerQSdk` after `AddTickerQ`. Providing the SDK automatically disables local background services and cron seeding — the Hub drives scheduling.
+
+    ```csharp Program.cs
+    builder.Services.AddTickerQ<TimeTickerEntity, CronTickerEntity>(options =>
+    {
+        options.AddTickerQSdk(sdk =>
+        {
+            sdk.SetApiKey("your-api-key")
+               .SetApiSecret("your-api-secret")
+               .SetCallbackUri(new Uri("https://your-app.com"))
+               .SetNodeName("my-node");
+        });
+    });
+    ```
+  </Step>
+
+  <Step title="Expose the execution endpoint">
+    The Hub calls back into your application over HTTP. Map the SDK endpoint so the Hub can reach it:
+
+    ```csharp Program.cs
+    app.MapGroup("/tickerq")
+       .ExposeSdkExecutionEndpoint();
+    ```
+
+    This registers two routes:
+
+    - `POST /tickerq/execute` — receives an execution context from the Hub and runs the matching function.
+    - `POST /tickerq/resync` — re-synchronises the local function registry with the Hub.
+  </Step>
+</Steps>
+
+#### SDK options
+
+| Method | Required | Description |
+|---|---|---|
+| `SetApiKey(string)` | Yes | Hub API key |
+| `SetApiSecret(string)` | Yes | Hub API secret |
+| `SetCallbackUri(Uri)` | Yes | Public URL where the Hub sends execution callbacks |
+| `SetNodeName(string)` | Yes | Unique name for this node in the Hub |
+
+### Using TickerQ.RemoteExecutor
+
+Use `TickerQ.RemoteExecutor` when this application should only *execute* jobs that another scheduler (or the Hub) enqueues. The remote executor registers functions, syncs them with the Hub on startup, and exposes webhook endpoints the Hub uses to push execution requests.
+
+<Steps>
+  <Step title="Install the package">
+    ```bash terminal
+    dotnet add package TickerQ.RemoteExecutor
+    ```
+  </Step>
+
+  <Step title="Register the remote executor">
+    ```csharp Program.cs
+    builder.Services.AddTickerQ<TimeTickerEntity, CronTickerEntity>(options =>
+    {
+        options.AddTickerRemoteExecutor(remote =>
+        {
+            remote.SetApiKey("your-api-key");
+            remote.SetApiSecret("your-api-secret");
+        });
+    });
+    ```
+  </Step>
+
+  <Step title="Map the webhook endpoints">
+    ```csharp Program.cs
+    app.MapTickerQRemoteExecutionEndpoints();
+
+    // Or with a path prefix
+    app.MapTickerQRemoteExecutionEndpoints("/tickerq");
+    ```
+
+    The mapped endpoints include:
+
+    - `POST /webhooks/hub` — triggers a function registry re-sync.
+    - `POST /functions/register` — receives function descriptors from the Hub.
+    - `POST /time-tickers`, `PUT /time-tickers`, etc. — CRUD operations forwarded by the Hub.
+    - `PUT /cron-ticker-occurrences/context` — updates execution status.
+  </Step>
+</Steps>
+
+## Connecting a Node.js application
+
+<Steps>
+  <Step title="Install the package">
+    ```bash terminal
+    npm install @tickerq/sdk
+    ```
+
+    Requires Node.js 18 or later. The package has **no runtime dependencies** — it uses only Node.js built-ins.
+  </Step>
+
+  <Step title="Initialise the SDK and register functions">
+    ```typescript src/scheduler.ts
+    import { TickerQSdk, TickerTaskPriority } from '@tickerq/sdk';
+
+    export const sdk = new TickerQSdk((opts) =>
+        opts
+            .setApiKey('your-api-key')
+            .setApiSecret('your-api-secret')
+            .setCallbackUri('https://your-app.com')
+            .setNodeName('my-node'),
+    );
+
+    // One-off job with a typed request
+    sdk.function('SendEmail', { priority: TickerTaskPriority.High })
+        .withRequest({ to: '', subject: '', body: '' })
+        .handle(async (ctx, signal) => {
+            console.log(`Sending email to ${ctx.request.to}`);
+        });
+
+    // Recurring cron job (no request)
+    sdk.function('DatabaseCleanup', {
+        cronExpression: '0 0 3 * * *',
+        priority: TickerTaskPriority.LongRunning,
+    }).handle(async (ctx, signal) => {
+        console.log('Running nightly cleanup');
+    });
+    ```
+  </Step>
+
+  <Step title="Mount endpoints and start">
+    <Tabs>
+      <Tab title="Express">
+        ```typescript src/app.ts
+        import express from 'express';
+        import { sdk } from './scheduler';
+
+        const app = express();
+        app.use(express.raw({ type: 'application/json' }));
+
+        sdk.expressHandlers().mount(app);
+
+        await sdk.start(); // freezes the function registry and syncs with Hub
+        app.listen(3000);
+        ```
+      </Tab>
+      <Tab title="Raw Node.js HTTP">
+        ```typescript src/app.ts
+        import { createServer } from 'node:http';
+        import { sdk } from './scheduler';
+
+        const handler = sdk.createHandler();
+        const server = createServer(handler);
+
+        await sdk.start();
+        server.listen(3000);
+        ```
+      </Tab>
+    </Tabs>
+
+    `sdk.start()` freezes the function registry (no further `sdk.function()` calls are allowed) and syncs all registered functions with the Hub.
+  </Step>
+</Steps>
+
+### Node.js SDK options
+
+| Method | Required | Description |
+|---|---|---|
+| `setApiKey(string)` | Yes | Hub API key |
+| `setApiSecret(string)` | Yes | Hub API secret |
+| `setCallbackUri(string)` | Yes | Public URL the Hub uses for callbacks |
+| `setNodeName(string)` | Yes | Unique node identifier |
+| `setTimeoutMs(number)` | No | HTTP timeout in ms (default: 30 000) |
+| `setAllowSelfSignedCerts(boolean)` | No | Skip TLS verification — development only |
+
+### Function options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `cronExpression` | `string` | — | 6-field cron expression (second precision) |
+| `priority` | `TickerTaskPriority` | `Normal` | `High`, `Normal`, `Low`, or `LongRunning` |
+| `maxConcurrency` | `number` | `0` (unlimited) | Max parallel executions for this function |
+| `requestType` | `string` | auto-detected | Type name displayed in the Hub UI |
+
+### Handler context
+
+Every handler receives a `TickerFunctionContext` and an `AbortSignal`:
+
+```typescript src/scheduler.ts
+sdk.function('ProcessOrder')
+    .withRequest({ orderId: 0, customerId: '' })
+    .handle(async (ctx, signal) => {
+        ctx.id;            // string  — unique execution ID
+        ctx.functionName;  // string  — registered function name
+        ctx.retryCount;    // number  — current retry attempt
+        ctx.scheduledFor;  // Date    — when this execution was scheduled
+        ctx.isDue;         // boolean
+
+        ctx.request.orderId;    // number  — fully typed
+        ctx.request.customerId; // string
+
+        if (signal.aborted) return; // honour cancellation
+    });
+```
+
+### Graceful shutdown
+
+```typescript src/app.ts
+process.on('SIGTERM', async () => {
+    await sdk.stop();       // waits up to 30 s for running tasks to finish
+    server.close();
+});
+```
+
+## Custom logging (Node.js)
+
+```typescript src/app.ts
+import type { TickerQLogger } from '@tickerq/sdk';
+
+const logger: TickerQLogger = {
+    info:  (msg, ...args) => console.log(msg, ...args),
+    warn:  (msg, ...args) => console.warn(msg, ...args),
+    error: (msg, ...args) => console.error(msg, ...args),
+};
+
+const sdk = new TickerQSdk(
+    (opts) => opts.setApiKey('...').setApiSecret('...').setCallbackUri('...').setNodeName('...'),
+    logger,
+);
+```
+
+<Note>
+TickerQ Hub is a separately hosted service at [hub.tickerq.net](https://hub.tickerq.net). You need an account and API credentials before connecting your application.
+</Note>

@@ -1,0 +1,136 @@
+---
+title: "[TickerFunction] Attribute"
+description: "Mark a method as a TickerQ job handler and configure its scheduling behaviour."
+---
+
+`[TickerFunction]` is a method-level attribute that identifies a method as a TickerQ job handler. The TickerQ source generator inspects this attribute at compile time to produce the registration and dispatch wiring — no reflection is performed at runtime.
+
+```csharp
+[AttributeUsage(AttributeTargets.Method)]
+public class TickerFunctionAttribute : Attribute
+```
+
+---
+
+## Constructors
+
+### Constructor 1 — with optional cron expression
+
+```csharp
+TickerFunctionAttribute(
+    string functionName,
+    string cronExpression = null,
+    TickerTaskPriority taskPriority = TickerTaskPriority.Normal,
+    int maxConcurrency = 0
+)
+```
+
+### Constructor 2 — priority shorthand (no cron)
+
+```csharp
+TickerFunctionAttribute(
+    string functionName,
+    TickerTaskPriority taskPriority,
+    int maxConcurrency = 0
+)
+```
+
+---
+
+## Parameters
+
+<ParamField path="functionName" type="string" required>
+  A unique string identifier for this job handler. The name is used to match ticker records in the persistence layer to the correct handler method. Two handlers in the same application must not share the same `functionName`.
+</ParamField>
+
+<ParamField path="cronExpression" type="string" default="null">
+  A standard cron expression that defines a recurring schedule (e.g. `"0 * * * *"` for hourly). When `null`, the handler is only invoked for time-based (one-shot) tickers. When provided, TickerQ registers the corresponding cron ticker automatically on startup unless `IgnoreSeedDefinedCronTickers()` is set.
+</ParamField>
+
+<ParamField path="taskPriority" type="TickerTaskPriority" default="TickerTaskPriority.Normal">
+  Controls the priority queue used when dispatching this job. Higher-priority jobs are dequeued before lower-priority ones when the thread pool is under load.
+
+  | Value | Description |
+  |---|---|
+  | `LongRunning` | Executes on a dedicated thread using the default `TaskScheduler`. Use for blocking or compute-heavy work. |
+  | `High` | Dequeued before `Normal` and `Low` jobs. Uses TickerTaskScheduler. |
+  | `Normal` | Default priority. Uses TickerTaskScheduler. |
+  | `Low` | Dequeued last. Uses TickerTaskScheduler. |
+</ParamField>
+
+<ParamField path="maxConcurrency" type="int" default="0">
+  Maximum number of concurrent executions allowed for this specific function. `0` means unlimited (bounded only by the global `MaxConcurrency` scheduler setting). Setting `maxConcurrency = 1` ensures at most one instance of this function runs at any time.
+</ParamField>
+
+---
+
+## Compile-time validation
+
+The TickerQ source generator validates `[TickerFunction]`-annotated methods at build time. It will emit a compiler error if:
+
+- The method is not `async` or does not return `Task`.
+- The `functionName` value is duplicated within the same assembly.
+- The method signature contains unsupported parameter types.
+
+This means misconfigured handlers are caught before the application ships, with no runtime discovery step required.
+
+---
+
+## Examples
+
+### Basic time-based handler
+
+```csharp
+[TickerFunction("SendWelcomeEmail")]
+public async Task SendWelcomeEmail(TickerFunctionContext context)
+{
+    // Invoked when a TimeTicker with FunctionName = "SendWelcomeEmail" is due.
+}
+```
+
+### Recurring cron handler
+
+```csharp
+// Runs at the top of every hour.
+[TickerFunction("GenerateDailyReport", "0 * * * *")]
+public async Task GenerateDailyReport(TickerFunctionContext context)
+{
+    // Invoked on the cron schedule.
+}
+```
+
+### High-priority handler
+
+```csharp
+[TickerFunction("ProcessPayment", TickerTaskPriority.High)]
+public async Task ProcessPayment(TickerFunctionContext<PaymentRequest> context)
+{
+    var payment = context.Request;
+    // Processed before Normal and Low priority jobs.
+}
+```
+
+### Limited concurrency handler
+
+```csharp
+// At most 2 instances of this function run simultaneously.
+[TickerFunction("SyncInventory", "*/5 * * * *", TickerTaskPriority.Normal, maxConcurrency: 2)]
+public async Task SyncInventory(TickerFunctionContext context)
+{
+    // ...
+}
+```
+
+### Long-running handler
+
+```csharp
+[TickerFunction("BuildSearchIndex", TickerTaskPriority.LongRunning)]
+public async Task BuildSearchIndex(TickerFunctionContext context)
+{
+    // Runs on a dedicated thread; will not block the TickerQ thread pool.
+}
+```
+
+<Tip>
+  Use `maxConcurrency: 1` together with a cron expression to guarantee that overlapping cron occurrences never run concurrently, without needing to handle the check inside the handler itself.
+</Tip>

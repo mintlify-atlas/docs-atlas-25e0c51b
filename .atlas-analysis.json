@@ -1,22 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "TickerQ",
+  "projectType": "sdk-library",
+  "projectName": "TickerQ",
+  "projectDescription": "A fast, reflection-free background job scheduler for .NET with source-generated task registration, EF Core and Redis persistence, cron and time-based scheduling, and a built-in real-time dashboard.",
   "theme": "luma",
-  "colors": {
-    "primary": "#4484c4"
-  },
-  "favicon": "https://media.brand.dev/919d28c1-35de-4647-a4e6-08a075160a82.png",
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/Arcenox-co/TickerQ"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/Arcenox-co/TickerQ"
-    }
-  },
+  "primaryColor": "#4484c4",
+  "lightColor": null,
+  "darkColor": null,
   "navigation": {
     "tabs": [
       {
@@ -104,5 +93,39 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Zero-reflection, AOT-ready source-generated job registration",
+    "Cron and one-off time-based job scheduling",
+    "EF Core persistence (PostgreSQL, SQL Server, SQLite, MySQL)",
+    "Redis persistence with multi-node distributed coordination",
+    "Built-in real-time SignalR dashboard with no paid add-ons",
+    "Configurable retry policies and backoff intervals",
+    "Job chaining with conditional run conditions (OnSuccess, OnFailure, etc.)",
+    "Typed request payloads with GZip compression support",
+    "OpenTelemetry tracing instrumentation",
+    "TickerQ Hub for centralized cross-application scheduling"
+  ],
+  "publicApiSurface": [
+    "AddTickerQ(services, options)",
+    "UseTickerQ(host, startMode)",
+    "[TickerFunction(name, cronExpression, priority, maxConcurrency)]",
+    "TickerFunctionContext / TickerFunctionContext<TRequest>",
+    "ITimeTickerManager<TTimeTicker>.AddAsync / UpdateAsync / DeleteAsync / AddBatchAsync",
+    "ICronTickerManager<TCronTicker>.AddAsync / UpdateAsync / DeleteAsync / AddBatchAsync",
+    "TickerOptionsBuilder.ConfigureScheduler()",
+    "TickerOptionsBuilder.AddOperationalStore() (EF Core)",
+    "TickerOptionsBuilder.AddStackExchangeRedis()",
+    "TickerOptionsBuilder.AddDashboard()",
+    "TickerOptionsBuilder.AddOpenTelemetryInstrumentation()",
+    "TickerOptionsBuilder.UseTickerSeeder()",
+    "TickerOptionsBuilder.SetExceptionHandler<THandler>()",
+    "TickerOptionsBuilder.DisableBackgroundServices()",
+    "TickerOptionsBuilder.UseGZipCompression()",
+    "DashboardOptionsBuilder.WithBasicAuth / WithApiKey / WithHostAuthentication / WithCustomAuth",
+    "TimeTickerEntity / CronTickerEntity",
+    "TickerStatus enum",
+    "RunCondition enum",
+    "TickerResult<TEntity>"
+  ]
 }

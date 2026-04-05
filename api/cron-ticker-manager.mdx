@@ -1,0 +1,306 @@
+---
+title: "ICronTickerManager"
+description: "Manage recurring cron-based scheduled jobs programmatically using the ICronTickerManager interface."
+---
+
+`ICronTickerManager<TCronTicker>` is the primary interface for creating, updating, and deleting cron-based recurring jobs at runtime.
+
+**Type constraint:** `TCronTicker : CronTickerEntity`
+
+Inject it using the default entity type or your own custom entity that extends `CronTickerEntity`.
+
+```csharp constructor injection
+public class MyService
+{
+    private readonly ICronTickerManager<CronTickerEntity> _manager;
+
+    public MyService(ICronTickerManager<CronTickerEntity> manager)
+    {
+        _manager = manager;
+    }
+}
+```
+
+```csharp minimal API
+app.MapPost("/cron", async (ICronTickerManager<CronTickerEntity> manager) =>
+{
+    var result = await manager.AddAsync(new CronTickerEntity
+    {
+        Function = "cleanup-old-records",
+        Expression = "0 3 * * *" // daily at 3 AM
+    });
+
+    return result.IsSucceeded ? Results.Ok(result.Result) : Results.Problem();
+});
+```
+
+---
+
+## Methods
+
+### `AddAsync`
+
+Creates a new cron ticker. TickerQ will start scheduling occurrences according to the cron expression immediately.
+
+```csharp
+Task<TickerResult<TCronTicker>> AddAsync(
+    TCronTicker entity,
+    CancellationToken cancellationToken = default
+)
+```
+
+<ParamField body="entity" type="TCronTicker" required>
+  The cron ticker entity to persist. Set at minimum `Function` and `Expression`.
+</ParamField>
+
+<ParamField body="cancellationToken" type="CancellationToken" default="default">
+  Token to cancel the operation.
+</ParamField>
+
+```csharp AddAsync example
+var cron = new CronTickerEntity
+{
+    Function = "send-digest-email",
+    Expression = "0 8 * * MON-FRI", // weekdays at 8 AM
+    Retries = 2,
+    RetryIntervals = new[] { 60, 300 } // 1 min, then 5 min
+};
+
+var result = await _manager.AddAsync(cron);
+
+if (result.IsSucceeded)
+{
+    Console.WriteLine($"Created cron job ID: {result.Result.Id}");
+}
+else
+{
+    Console.WriteLine($"Failed: {result.Exception?.Message}");
+}
+```
+
+---
+
+### `UpdateAsync`
+
+Updates an existing cron ticker. The entity must already exist in the database.
+
+```csharp
+Task<TickerResult<TCronTicker>> UpdateAsync(
+    TCronTicker cronTicker,
+    CancellationToken cancellationToken = default
+)
+```
+
+<ParamField body="cronTicker" type="TCronTicker" required>
+  The cron ticker entity with updated values. Must have a valid `Id`.
+</ParamField>
+
+<ParamField body="cancellationToken" type="CancellationToken" default="default">
+  Token to cancel the operation.
+</ParamField>
+
+```csharp Update expression example
+// Change schedule from daily to hourly
+existingCron.Expression = "0 * * * *";
+
+var result = await _manager.UpdateAsync(existingCron);
+
+if (result.IsSucceeded)
+{
+    Console.WriteLine("Schedule updated");
+}
+```
+
+```csharp Enable or disable a cron job
+// Disable a cron job without deleting it
+existingCron.IsEnabled = false;
+await _manager.UpdateAsync(existingCron);
+
+// Re-enable it later
+existingCron.IsEnabled = true;
+await _manager.UpdateAsync(existingCron);
+```
+
+---
+
+### `DeleteAsync`
+
+Deletes a single cron ticker by its ID. All future occurrences are cancelled.
+
+```csharp
+Task<TickerResult<TCronTicker>> DeleteAsync(
+    Guid id,
+    CancellationToken cancellationToken = default
+)
+```
+
+<ParamField body="id" type="Guid" required>
+  The ID of the cron ticker to delete.
+</ParamField>
+
+<ParamField body="cancellationToken" type="CancellationToken" default="default">
+  Token to cancel the operation.
+</ParamField>
+
+```csharp DeleteAsync example
+var result = await _manager.DeleteAsync(cronTickerId);
+
+if (result.IsSucceeded)
+{
+    Console.WriteLine($"Deleted rows: {result.AffectedRows}");
+}
+```
+
+---
+
+### `AddBatchAsync`
+
+Creates multiple cron tickers in a single operation.
+
+```csharp
+Task<TickerResult<List<TCronTicker>>> AddBatchAsync(
+    List<TCronTicker> entities,
+    CancellationToken cancellationToken = default
+)
+```
+
+<ParamField body="entities" type="List<TCronTicker>" required>
+  List of cron ticker entities to insert.
+</ParamField>
+
+<ParamField body="cancellationToken" type="CancellationToken" default="default">
+  Token to cancel the operation.
+</ParamField>
+
+```csharp AddBatchAsync example
+var jobs = new List<CronTickerEntity>
+{
+    new CronTickerEntity
+    {
+        Function = "backup-database",
+        Expression = "0 2 * * *" // 2 AM daily
+    },
+    new CronTickerEntity
+    {
+        Function = "prune-logs",
+        Expression = "0 4 * * SUN" // 4 AM every Sunday
+    },
+    new CronTickerEntity
+    {
+        Function = "refresh-cache",
+        Expression = "*/15 * * * *" // every 15 minutes
+    }
+};
+
+var result = await _manager.AddBatchAsync(jobs);
+
+if (result.IsSucceeded)
+{
+    Console.WriteLine($"Created {result.Result.Count} cron jobs");
+}
+```
+
+---
+
+### `UpdateBatchAsync`
+
+Updates multiple cron tickers in a single operation.
+
+```csharp
+Task<TickerResult<List<TCronTicker>>> UpdateBatchAsync(
+    List<TCronTicker> cronTickers,
+    CancellationToken cancellationToken = default
+)
+```
+
+<ParamField body="cronTickers" type="List<TCronTicker>" required>
+  List of cron ticker entities with updated values. Each must have a valid `Id`.
+</ParamField>
+
+<ParamField body="cancellationToken" type="CancellationToken" default="default">
+  Token to cancel the operation.
+</ParamField>
+
+```csharp Disable all cron jobs in bulk
+foreach (var cron in existingCrons)
+{
+    cron.IsEnabled = false;
+}
+
+var result = await _manager.UpdateBatchAsync(existingCrons);
+
+if (result.IsSucceeded)
+{
+    Console.WriteLine($"Disabled {result.AffectedRows} cron jobs");
+}
+```
+
+---
+
+### `DeleteBatchAsync`
+
+Deletes multiple cron tickers by their IDs.
+
+```csharp
+Task<TickerResult<TCronTicker>> DeleteBatchAsync(
+    List<Guid> ids,
+    CancellationToken cancellationToken = default
+)
+```
+
+<ParamField body="ids" type="List<Guid>" required>
+  List of cron ticker IDs to delete.
+</ParamField>
+
+<ParamField body="cancellationToken" type="CancellationToken" default="default">
+  Token to cancel the operation.
+</ParamField>
+
+```csharp DeleteBatchAsync example
+var ids = existingCrons.Select(c => c.Id).ToList();
+
+var result = await _manager.DeleteBatchAsync(ids);
+
+if (result.IsSucceeded)
+{
+    Console.WriteLine($"Deleted {result.AffectedRows} cron jobs");
+}
+```
+
+---
+
+## TickerResult\<T\>
+
+All methods return a `TickerResult<T>`. Its fields are read-only and set internally by TickerQ.
+
+<ResponseField name="IsSucceeded" type="bool" required>
+  `true` if the operation completed without error; `false` otherwise.
+</ResponseField>
+
+<ResponseField name="Result" type="T">
+  The persisted entity or list of entities returned after the operation. `null` on failure.
+</ResponseField>
+
+<ResponseField name="AffectedRows" type="int">
+  Number of database rows affected by the operation.
+</ResponseField>
+
+<ResponseField name="Exception" type="Exception">
+  The exception thrown during the operation, if any. `null` on success.
+</ResponseField>
+
+```csharp Handling TickerResult
+var result = await _manager.AddAsync(cron);
+
+if (!result.IsSucceeded)
+{
+    logger.LogError(result.Exception, "Failed to create cron job");
+    return;
+}
+
+logger.LogInformation(
+    "Cron job {Id} created. Affected rows: {Rows}",
+    result.Result.Id,
+    result.AffectedRows
+);
+```

@@ -1,0 +1,171 @@
+---
+title: "AOT & Trimming"
+description: "Use TickerQ in Ahead-of-Time compiled and trimmed .NET applications."
+---
+
+TickerQ is designed to work correctly in Ahead-of-Time (AOT) compiled and trimmed .NET applications. The source generator eliminates the reflection that would otherwise be needed to discover and invoke ticker functions, and all core library code in `TickerQ.Utilities` is annotated to be trimming-safe.
+
+## How AOT compatibility works
+
+TickerQ uses a Roslyn incremental source generator (`TickerQ.SourceGenerator`) to emit all function registration code at **compile time**. The generated file contains a `[ModuleInitializer]` method that runs once when the assembly is loaded and registers every `[TickerFunction]`-annotated method into `TickerFunctionProvider` using pre-built delegates:
+
+```csharp
+// TickerQ readonly auto-generated file — do not edit.
+[global::System.Runtime.CompilerServices.ModuleInitializer]
+public static void Initialize()
+{
+    var tickerFunctionDelegateDict =
+        new Dictionary<string, (string, TickerTaskPriority, TickerFunctionDelegate, int)>(2);
+
+    // Each entry is a pre-compiled delegate — no reflection at runtime.
+    tickerFunctionDelegateDict.TryAdd("SendReport", ("", TickerTaskPriority.Normal, ...));
+    tickerFunctionDelegateDict.TryAdd("NightlyCleanup", ("0 2 * * *", TickerTaskPriority.Normal, ...));
+
+    TickerFunctionProvider.RegisterFunctions(tickerFunctionDelegateDict, 2);
+    RegisterRequestTypes();
+}
+```
+
+<Note>
+  The source generator runs at compile time. There is no dynamic code generation, no `Reflection.Emit`, and no runtime assembly scanning in `TickerQ.Utilities` or `TickerQ.SourceGenerator`.
+</Note>
+
+## Trimming safety
+
+All types in `TickerQ.Utilities` and `TickerQ.SourceGenerator` are trimming-safe:
+
+- Function discovery happens through the generated `[ModuleInitializer]`, not through `Assembly.GetTypes()` or attribute scanning.
+- `FrozenDictionary` is used for the final function registry, which requires no reflection to read.
+- No `dynamic` keyword or late-bound `Activator.CreateInstance` calls are present in the hot path.
+
+<Tip>
+  If you are publishing with `<PublishTrimmed>true</PublishTrimmed>`, add `<TrimmerRootDescriptor>` entries only for your own application types that TickerQ does not see at compile time (such as request payload types used only through generics at runtime).
+</Tip>
+
+## EF Core
+
+TickerQ's EF Core integration (`TickerQ.EntityFrameworkCore`) follows standard EF Core AOT guidance. When publishing with AOT enabled, follow the [EF Core NativeAOT documentation](https://learn.microsoft.com/en-us/ef/core/performance/nativeaot) and use a compiled model:
+
+<CodeGroup>
+
+```bash publish with AOT
+dotnet publish -r linux-x64 -c Release /p:PublishAot=true
+```
+
+```csharp Program.cs — compiled EF Core model
+builder.Services.AddDbContext<TickerQDbContext>(options =>
+{
+    options.UseSqlite("Data Source=tickerq.db");
+    options.UseModel(TickerQDbContextModel.Instance); // pre-compiled model
+});
+```
+
+</CodeGroup>
+
+## Redis and AOT-safe JSON serialization
+
+The StackExchange Redis persistence provider (`TickerQ.Caching.StackExchangeRedis`) serializes and deserializes ticker entities using `System.Text.Json`. By default it uses reflection-based serialization, which is not compatible with NativeAOT or full trimming.
+
+To opt in to AOT-safe serialization, create a `JsonSerializerContext` that covers your entity types and pass it to `TickerQRedisOptionBuilder.JsonSerializerContext`:
+
+<Steps>
+
+<Step title="Define a JsonSerializerContext">
+
+Annotate a `JsonSerializerContext` with `[JsonSerializable]` for every entity type TickerQ will serialize through Redis. At minimum this includes your `TTimeTicker`, `TCronTicker`, and the `CronTickerOccurrenceEntity<TCronTicker>` type:
+
+<CodeGroup>
+
+```csharp Json/TickerQJsonContext.cs — default entity types
+using System.Text.Json.Serialization;
+using TickerQ.Utilities.Entities;
+
+[JsonSerializable(typeof(TimeTickerEntity))]
+[JsonSerializable(typeof(CronTickerEntity))]
+[JsonSerializable(typeof(CronTickerOccurrenceEntity<CronTickerEntity>))]
+[JsonSourceGenerationOptions(WriteIndented = false)]
+internal partial class TickerQJsonContext : JsonSerializerContext
+{
+}
+```
+
+```csharp Json/TickerQJsonContext.cs — custom entity types
+using System.Text.Json.Serialization;
+using TickerQ.Utilities.Entities;
+
+[JsonSerializable(typeof(AppTimeTicker))]
+[JsonSerializable(typeof(AppCronTicker))]
+[JsonSerializable(typeof(CronTickerOccurrenceEntity<AppCronTicker>))]
+[JsonSourceGenerationOptions(WriteIndented = false)]
+internal partial class TickerQJsonContext : JsonSerializerContext
+{
+}
+```
+
+</CodeGroup>
+
+</Step>
+
+<Step title="Pass the context to the Redis option builder">
+
+<CodeGroup>
+
+```csharp Program.cs
+builder.Services.AddTickerQ(options =>
+{
+    options.AddStackExchangeRedis(redis =>
+    {
+        redis.Configuration = "localhost:6379";
+        redis.JsonSerializerContext = TickerQJsonContext.Default;
+    });
+});
+```
+
+</CodeGroup>
+
+When `JsonSerializerContext` is set, the Redis persistence provider uses `JsonTypeInfo`-based overloads of `JsonSerializer.Serialize` and `JsonSerializer.Deserialize`, which are fully trimming-safe.
+
+</Step>
+
+<Step title="Publish with AOT">
+
+<CodeGroup>
+
+```bash publish NativeAOT
+dotnet publish -r linux-x64 -c Release /p:PublishAot=true
+```
+
+```bash publish trimmed (non-NativeAOT)
+dotnet publish -r linux-x64 -c Release /p:PublishTrimmed=true /p:TrimMode=full
+```
+
+</CodeGroup>
+
+</Step>
+
+</Steps>
+
+## What to annotate
+
+<AccordionGroup>
+  <Accordion title="Request payload types">
+    If your ticker functions accept typed request payloads (via `TickerFunctionContext<T>`), those types are serialized and deserialized by `TickerHelper`. When using the Redis provider with AOT, add `[JsonSerializable(typeof(YourRequestType))]` to your `JsonSerializerContext`. When using EF Core, request payloads are stored as raw bytes and deserialized using `JsonSerializer` with the options configured via `ConfigureRequestJsonOptions()` — provide a source-generated context there as well.
+  </Accordion>
+  <Accordion title="Custom entity properties">
+    If you extended `TimeTickerEntity` or `CronTickerEntity` with additional properties, include those derived types in your `[JsonSerializable]` annotations so the source generator emits the correct `JsonTypeInfo`.
+  </Accordion>
+  <Accordion title="TickerQ internal types">
+    You do not need to annotate any internal TickerQ types. The library ships with its own trimming annotations and does not expose types that require runtime serialization beyond those listed above.
+  </Accordion>
+</AccordionGroup>
+
+## Summary
+
+| Concern | Status |
+|---|---|
+| Function discovery | Compile-time via `[ModuleInitializer]` — no reflection |
+| `TickerQ.Utilities` trimming | Safe |
+| `TickerQ.SourceGenerator` | Compile-time only — no runtime code generation |
+| EF Core persistence | Follow standard EF Core AOT guidance |
+| Redis JSON serialization | Provide a `JsonSerializerContext` via `TickerQRedisOptionBuilder.JsonSerializerContext` |
+| Request payload types | Annotate with `[JsonSerializable]` in your context |

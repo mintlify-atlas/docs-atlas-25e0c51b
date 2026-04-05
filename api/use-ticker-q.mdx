@@ -1,0 +1,104 @@
+---
+title: "UseTickerQ"
+description: "Activate the TickerQ scheduler on an IHost after the application is built."
+---
+
+`UseTickerQ` is an `IHost` extension method that activates the TickerQ scheduler. It signals the initializer hosted service to begin startup I/O (function discovery, seeding, external provider startup), wires internal notification callbacks, and applies dashboard middleware if configured.
+
+## Method signature
+
+```csharp
+IHost UseTickerQ(
+    this IHost host,
+    TickerQStartMode qStartMode = TickerQStartMode.Immediate
+)
+```
+
+## Parameters
+
+<ParamField path="host" type="IHost" required>
+  The built host instance. In ASP.NET Core applications this is the `WebApplication` returned by `builder.Build()`.
+</ParamField>
+
+<ParamField path="qStartMode" type="TickerQStartMode" default="TickerQStartMode.Immediate">
+  Controls when the scheduler begins processing jobs after the host starts.
+
+  | Value | Behavior |
+  |---|---|
+  | `Immediate` | The scheduler starts processing jobs as soon as the host starts. |
+  | `Manual` | The scheduler is registered but skips its first run. Processing must be started manually via `ITickerQHostScheduler`. |
+</ParamField>
+
+---
+
+## TickerQStartMode
+
+<ResponseField name="Immediate" type="enum value">
+  Default mode. The scheduler starts automatically when the host starts. Background services are registered and begin polling immediately.
+</ResponseField>
+
+<ResponseField name="Manual" type="enum value">
+  The scheduler background services are registered but `SkipFirstRun` is set to `true`. Use this when you need to control exactly when job processing begins — for example, after completing a warm-up sequence. Resume processing by resolving `ITickerQHostScheduler` from the DI container and calling the appropriate start method.
+</ResponseField>
+
+---
+
+## What UseTickerQ does internally
+
+1. Resolves `TickerQInitializerHostedService` and sets `InitializationRequested = true`, which causes the hosted service to perform startup I/O (function discovery, seeding, external provider initialization) when the host starts.
+2. If background services are registered, sets `SkipFirstRun` on the scheduler based on the provided `TickerQStartMode`.
+3. Subscribes to `TickerExecutionContext.NotifyCoreAction` and forwards internal events (host exceptions, next occurrence updates, host status, active thread count) to `ITickerQNotificationHubSender` — used by the dashboard in real time.
+4. Invokes any pending dashboard application middleware action registered by `AddDashboard()`.
+
+<Warning>
+  `UseTickerQ` must be called **after** `builder.Build()` and **before** `app.Run()`. Calling it before the host is built will throw a `NullReferenceException` because the DI container is not yet available.
+</Warning>
+
+---
+
+## Examples
+
+### Immediate mode (default)
+
+```csharp Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddTickerQ(options =>
+{
+    options.AddOperationalStore();
+});
+
+var app = builder.Build();
+
+app.UseTickerQ(); // equivalent to UseTickerQ(TickerQStartMode.Immediate)
+
+app.Run();
+```
+
+### Manual mode
+
+```csharp Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddTickerQ(options =>
+{
+    options.AddOperationalStore();
+});
+
+var app = builder.Build();
+
+app.UseTickerQ(TickerQStartMode.Manual);
+
+// Perform warm-up work here before allowing the scheduler to run.
+await DoWarmUpAsync(app.Services);
+
+// Then resolve ITickerQHostScheduler to start processing.
+var scheduler = app.Services.GetRequiredService<ITickerQHostScheduler>();
+// (Call the relevant start method on the scheduler interface.)
+
+app.Run();
+```
+
+<Note>
+  When `DisableBackgroundServices()` was called during registration, `UseTickerQ` still completes successfully. The scheduler configuration step is silently skipped because no background scheduler service was registered.
+</Note>

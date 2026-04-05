@@ -1,0 +1,212 @@
+---
+title: "Dashboard Setup"
+description: "Install and configure the TickerQ web dashboard to monitor and manage background jobs in real time."
+---
+
+The TickerQ dashboard is a built-in web UI that lets you inspect running jobs, manage cron schedules, view job history, and control the scheduler host — all in real time via SignalR.
+
+## Installation
+
+<Steps>
+  <Step title="Install the package">
+
+```bash
+dotnet add package TickerQ.Dashboard
+```
+
+  </Step>
+  <Step title="Register the dashboard">
+
+Call `AddDashboard()` on your TickerQ builder in `Program.cs`:
+
+```csharp Program.cs
+builder.Services.AddTickerQ(options =>
+{
+    // ... your TickerQ configuration
+})
+.AddDashboard();
+```
+
+No additional `app.Use*` call is needed. The dashboard middleware registers itself automatically.
+
+  </Step>
+  <Step title="Open the dashboard">
+
+Navigate to the default path in your browser:
+
+```
+http://localhost:5000/tickerq/dashboard
+```
+
+  </Step>
+</Steps>
+
+## Configuration
+
+Pass an `Action<DashboardOptionsBuilder>` to `AddDashboard()` to customise behaviour:
+
+```csharp Program.cs
+builder.Services.AddTickerQ(options => { /* ... */ })
+    .AddDashboard(dashboard =>
+    {
+        dashboard.SetBasePath("/admin/jobs");
+        dashboard.SetBackendDomain("https://api.example.com");
+        dashboard.SetGroupName("tickerq");
+        dashboard.SetCorsPolicy(cors => cors
+            .WithOrigins("https://app.example.com")
+            .AllowAnyHeader()
+            .AllowCredentials());
+        dashboard.ConfigureDashboardJsonOptions(json =>
+        {
+            json.WriteIndented = true;
+        });
+    });
+```
+
+### DashboardOptionsBuilder reference
+
+<AccordionGroup>
+  <Accordion title="SetBasePath(string)">
+    Changes the URL path where the dashboard is served.
+
+    Default: `/tickerq/dashboard`
+
+    ```csharp
+    dashboard.SetBasePath("/admin/jobs");
+    // Dashboard is now at /admin/jobs
+    ```
+  </Accordion>
+  <Accordion title="SetBackendDomain(string)">
+    Sets an explicit backend API origin. Use this when the dashboard frontend and the API are served from different domains (reverse-proxy or cross-origin deployments).
+
+    ```csharp
+    dashboard.SetBackendDomain("https://api.example.com");
+    ```
+  </Accordion>
+  <Accordion title="SetGroupName(string)">
+    Assigns an OpenAPI group name to all dashboard endpoints. Useful when you generate OpenAPI documentation and want dashboard routes grouped separately.
+
+    ```csharp
+    dashboard.SetGroupName("tickerq-dashboard");
+    ```
+  </Accordion>
+  <Accordion title="SetCorsPolicy(Action<CorsPolicyBuilder>)">
+    Overrides the default CORS policy for dashboard API endpoints. The default policy allows any origin with credentials.
+
+    ```csharp
+    dashboard.SetCorsPolicy(cors => cors
+        .WithOrigins("https://app.example.com")
+        .AllowAnyHeader()
+        .AllowCredentials());
+    ```
+  </Accordion>
+  <Accordion title="ConfigureDashboardJsonOptions(Action<JsonSerializerOptions>)">
+    Configures `JsonSerializerOptions` used exclusively by dashboard API endpoints. These options are intentionally isolated from your application's global JSON settings to prevent dashboard APIs from breaking if you change serialization globally.
+
+    ```csharp
+    dashboard.ConfigureDashboardJsonOptions(json =>
+    {
+        json.WriteIndented = true;
+    });
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Custom middleware hooks
+
+`DashboardOptionsBuilder` exposes three middleware hooks that let you inject ASP.NET Core middleware into the dashboard's internal pipeline:
+
+| Property | Runs |
+|---|---|
+| `PreDashboardMiddleware` | Before static files and authentication |
+| `CustomMiddleware` | After authentication, before endpoint routing |
+| `PostDashboardMiddleware` | After all endpoints are mapped |
+
+```csharp Program.cs
+.AddDashboard(dashboard =>
+{
+    dashboard.PreDashboardMiddleware = app =>
+    {
+        app.Use(async (ctx, next) =>
+        {
+            // Runs before any dashboard handling
+            await next();
+        });
+    };
+
+    dashboard.PostDashboardMiddleware = app =>
+    {
+        app.Use(async (ctx, next) =>
+        {
+            // Runs after endpoints are mapped
+            await next();
+        });
+    };
+});
+```
+
+## What the dashboard shows
+
+<Columns cols={2}>
+  <Card title="Active jobs" icon="play">
+    Jobs currently being executed, including function name, type, and which node is running them.
+  </Card>
+  <Card title="Cron schedules" icon="clock">
+    All registered cron tickers with their expressions, next occurrence, and enable/disable toggle.
+  </Card>
+  <Card title="Job history" icon="list">
+    Completed, failed, and cancelled jobs with execution time and status breakdowns.
+  </Card>
+  <Card title="Thread pool status" icon="cpu">
+    Concurrency settings, idle worker timeout, and active worker count per node.
+  </Card>
+  <Card title="Host status" icon="server">
+    Scheduler host state with start, stop, and restart controls.
+  </Card>
+  <Card title="Real-time updates" icon="activity">
+    All data refreshes automatically via a persistent SignalR connection — no manual page reloads needed.
+  </Card>
+</Columns>
+
+## Real-time updates via SignalR
+
+The dashboard maintains a WebSocket connection to `/ticker-notification-hub` using ASP.NET Core SignalR. Job state changes, host status transitions, and new cron occurrences are pushed to all connected clients instantly.
+
+No additional SignalR configuration is required in your application — `AddDashboard()` calls `services.AddSignalR()` internally.
+
+<Note>
+If your application already calls `services.AddSignalR()`, there is no conflict. The dashboard reuses the existing SignalR infrastructure.
+</Note>
+
+## Complete setup example
+
+```csharp Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddTickerQ(options =>
+{
+    options.SetMaxConcurrency(10);
+    options.SetNodeIdentifier("web-1");
+})
+.UseEntityFrameworkStore<AppDbContext>()
+.AddDashboard(dashboard =>
+{
+    dashboard.SetBasePath("/tickerq/dashboard");
+    dashboard.SetCorsPolicy(cors => cors
+        .SetIsOriginAllowed(_ => true)
+        .AllowAnyHeader()
+        .AllowCredentials());
+
+    // Protect the dashboard — see Authentication
+    dashboard.WithBasicAuth("admin", "s3cr3t");
+});
+
+var app = builder.Build();
+
+app.UseTickerQ();
+app.Run();
+```
+
+<Tip>
+Authentication is configured on the same `DashboardOptionsBuilder`. See [Dashboard Authentication](/dashboard/authentication) for all available modes.
+</Tip>

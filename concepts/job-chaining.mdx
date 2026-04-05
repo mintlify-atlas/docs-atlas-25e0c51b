@@ -1,0 +1,230 @@
+---
+title: "Job Chaining"
+description: "Link time tickers together so a child job runs only when its parent reaches a specific status — success, failure, cancellation, or any terminal state."
+---
+
+Job chaining lets you build workflows by linking time tickers in a parent/child tree. Each child declares a `RunCondition` that tells TickerQ which parent status must be reached before the child is promoted from `Idle` and scheduled.
+
+## How it works
+
+When you persist a time ticker with a `ParentId` and `RunCondition`, TickerQ holds it in `Idle` state. After the parent ticker reaches a terminal status, TickerQ evaluates the child's `RunCondition`. If it matches, the child is promoted to `Queued` at its own `ExecutionTime`. If it does not match, the child is moved to `Skipped`.
+
+## `RunCondition` values
+
+| Value | Trigger |
+|---|---|
+| `OnSuccess` | Parent status is `Done` or `DueDone`. |
+| `OnFailure` | Parent status is `Failed`. |
+| `OnCancelled` | Parent status is `Cancelled`. |
+| `OnFailureOrCancelled` | Parent status is `Failed` or `Cancelled`. |
+| `OnAnyCompletedStatus` | Parent status is `Done`, `DueDone`, `Failed`, or `Cancelled`. Like a `finally` block — `Skipped` is excluded. |
+| `InProgress` | Child is dispatched as soon as the parent reaches `InProgress` (parallel fan-out). |
+
+<Info>
+  `Skipped` is intentionally excluded from `OnAnyCompletedStatus`. If the parent was itself skipped due to an unmet condition, downstream jobs are also skipped, preventing silent no-ops from propagating.
+</Info>
+
+## Setting up a chain
+
+Add child tickers to the parent's `Children` collection before calling `AddAsync`. TickerQ persists the entire tree in one call and manages `ParentId` linking internally.
+
+```csharp title="Chain setup"
+await manager.AddAsync(new TimeTickerEntity
+{
+    Function      = "ExportData",
+    ExecutionTime = DateTime.UtcNow.AddMinutes(2),
+    Children      = new List<TimeTickerEntity>
+    {
+        new TimeTickerEntity
+        {
+            Function      = "EmailExportLink",
+            ExecutionTime = DateTime.UtcNow.AddMinutes(2),
+            RunCondition  = RunCondition.OnSuccess
+        }
+    }
+});
+```
+
+<Note>
+  The child's `ExecutionTime` controls when it runs *after* the condition is met. It will not execute before its `RunCondition` is satisfied, regardless of the `ExecutionTime` value.
+</Note>
+
+### Fluent builder API
+
+For complex chains with multiple children and grandchildren, use `FluentChainTickerBuilder<TTimeTicker>`:
+
+```csharp title="Fluent chain builder"
+var chain = FluentChainTickerBuilder<TimeTickerEntity>
+    .BeginWith(parent => parent
+        .SetFunction("ExportData")
+        .SetExecutionTime(DateTime.UtcNow.AddMinutes(2)))
+    .WithFirstChild(child => child
+        .SetFunction("EmailExportLink")
+        .SetExecutionTime(DateTime.UtcNow.AddMinutes(2))
+        .SetRunCondition(RunCondition.OnSuccess))
+    .WithSecondChild(child => child
+        .SetFunction("NotifyFailureTeam")
+        .SetExecutionTime(DateTime.UtcNow.AddMinutes(2))
+        .SetRunCondition(RunCondition.OnFailure))
+    .Build();
+
+await manager.AddAsync(chain);
+```
+
+The builder supports up to 5 children and 5 grandchildren per node, and prevents duplicate configuration via runtime guards.
+
+## Use cases
+
+<CardGroup cols={2}>
+  <Card title="Sequential pipeline" icon="arrow-right">
+    Run steps one after the other, stopping the chain on failure.
+
+    ```
+    ExportData (OnSuccess)
+        └── CompressFile (OnSuccess)
+              └── UploadToS3
+    ```
+  </Card>
+  <Card title="Error handler" icon="triangle-exclamation">
+    Run a cleanup or notification job only when the primary job fails.
+
+    ```
+    ProcessPayment
+        └── NotifyFailure (OnFailure)
+    ```
+  </Card>
+  <Card title="Finally block" icon="check">
+    Always run a cleanup step regardless of outcome, but skip if the parent was itself skipped.
+
+    ```
+    AcquireLock
+        └── ReleaseLock (OnAnyCompletedStatus)
+    ```
+  </Card>
+  <Card title="Parallel fan-out" icon="code-branch">
+    Start multiple child jobs as soon as the parent begins executing.
+
+    ```
+    LoadData (InProgress triggers)
+        ├── ProcessRegionA
+        └── ProcessRegionB
+    ```
+  </Card>
+</CardGroup>
+
+## Code examples
+
+<Tabs>
+  <Tab title="Sequential pipeline">
+    ```csharp title="SchedulePipeline.cs"
+    // Build a 3-step chain in a single AddAsync call.
+    // Each step runs only if the previous step succeeded.
+    await manager.AddAsync(new TimeTickerEntity
+    {
+        Function      = "ExportData",
+        ExecutionTime = DateTime.UtcNow.AddMinutes(1),
+        Children      = new List<TimeTickerEntity>
+        {
+            new TimeTickerEntity
+            {
+                Function      = "CompressExport",
+                ExecutionTime = DateTime.UtcNow.AddMinutes(1),
+                RunCondition  = RunCondition.OnSuccess,
+                Children      = new List<TimeTickerEntity>
+                {
+                    new TimeTickerEntity
+                    {
+                        Function      = "UploadToS3",
+                        ExecutionTime = DateTime.UtcNow.AddMinutes(1),
+                        RunCondition  = RunCondition.OnSuccess
+                    }
+                }
+            }
+        }
+    });
+    ```
+  </Tab>
+  <Tab title="Error handler">
+    ```csharp title="ScheduleWithFallback.cs"
+    // Notify only on permanent failure (after all retries are exhausted).
+    await manager.AddAsync(new TimeTickerEntity
+    {
+        Function       = "ProcessPayment",
+        ExecutionTime  = DateTime.UtcNow.AddSeconds(10),
+        Retries        = 2,
+        RetryIntervals = new[] { 30, 60 },
+        Children       = new List<TimeTickerEntity>
+        {
+            new TimeTickerEntity
+            {
+                Function      = "SendPaymentFailureAlert",
+                ExecutionTime = DateTime.UtcNow.AddSeconds(10),
+                RunCondition  = RunCondition.OnFailure
+            }
+        }
+    });
+    ```
+  </Tab>
+  <Tab title="Finally block">
+    ```csharp title="ScheduleWithCleanup.cs"
+    // Always release the lock — except if AcquireResourceLock was itself skipped.
+    await manager.AddAsync(new TimeTickerEntity
+    {
+        Function      = "AcquireResourceLock",
+        ExecutionTime = DateTime.UtcNow.AddSeconds(5),
+        Children      = new List<TimeTickerEntity>
+        {
+            new TimeTickerEntity
+            {
+                Function      = "ReleaseResourceLock",
+                ExecutionTime = DateTime.UtcNow.AddSeconds(5),
+                RunCondition  = RunCondition.OnAnyCompletedStatus
+            }
+        }
+    });
+    ```
+  </Tab>
+  <Tab title="Parallel fan-out">
+    ```csharp title="ScheduleParallel.cs"
+    // Both children start as soon as LoadData transitions to InProgress.
+    await manager.AddAsync(new TimeTickerEntity
+    {
+        Function      = "LoadData",
+        ExecutionTime = DateTime.UtcNow.AddSeconds(5),
+        Children      = new List<TimeTickerEntity>
+        {
+            new TimeTickerEntity
+            {
+                Function      = "ProcessRegionA",
+                ExecutionTime = DateTime.UtcNow.AddSeconds(5),
+                RunCondition  = RunCondition.InProgress
+            },
+            new TimeTickerEntity
+            {
+                Function      = "ProcessRegionB",
+                ExecutionTime = DateTime.UtcNow.AddSeconds(5),
+                RunCondition  = RunCondition.InProgress
+            }
+        }
+    });
+    ```
+  </Tab>
+</Tabs>
+
+## Accessing chain context in a function
+
+Inside a ticker function, you can read the job's own `Id` and check `context.Type` to know whether you are executing a `TimeTicker` or a `CronTickerOccurrence`.
+
+```csharp title="Jobs.cs — inspect context"
+[TickerFunction("ProcessRegionA")]
+public async Task ProcessRegionAAsync(
+    TickerFunctionContext context,
+    CancellationToken cancellationToken)
+{
+    // context.Id          — this ticker's Guid (use to schedule follow-up children)
+    // context.RetryCount  — useful to decide whether to skip expensive side-effects on retry
+    // context.IsDue       — false if this ran after its scheduled ExecutionTime
+
+    await ProcessAsync("region-a", cancellationToken);
+}
+```

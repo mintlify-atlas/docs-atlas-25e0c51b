@@ -1,0 +1,70 @@
+---
+title: Introduction
+description: TickerQ is the modern background job scheduler for .NET — source-generated, reflection-free, and built for production from day one.
+---
+
+TickerQ uses Roslyn source generators to register job functions at compile time. There is no runtime reflection, no magic strings, and no separate storage infrastructure. Decorate a method, choose a persistence backend you already have, and start scheduling.
+
+## Why TickerQ?
+
+| Feature | Details |
+|---|---|
+| **Zero reflection, AOT ready** | Source generators at compile time. No runtime reflection, no magic strings, fully trimmable. |
+| **Your database** | EF Core (PostgreSQL, SQL Server, SQLite, MySQL) or Redis. No separate storage. |
+| **Real-time dashboard** | Built-in SignalR dashboard. Monitor, inspect, and manage jobs — no paid add-ons. |
+| **Multi-node** | Redis heartbeats, dead-node cleanup, and lock-based coordination. Just add instances. |
+| **Minimal setup** | `AddTickerQ()` → decorate a method → schedule. Minutes, not hours. |
+
+## Features
+
+- **Time and cron scheduling** — one-off and recurring jobs with full cron expression support
+- **Source-generated** — compile-time function registration via `TickerQ.SourceGenerator` for maximum performance
+- **Dual persistence** — EF Core (PostgreSQL, SQL Server, SQLite, MySQL) or Redis; falls back to in-memory for development
+- **Live dashboard** — real-time monitoring UI powered by SignalR
+- **Retry and throttling** — configurable retry policies with backoff and per-function concurrency limits
+- **Dependency injection** — first-class DI support; job classes resolve services from the container
+- **Multi-node** — distributed coordination via Redis heartbeats and dead-node cleanup
+- **OpenTelemetry** — built-in activity tracing via `TickerQ.Instrumentation.OpenTelemetry`
+
+## How it works
+
+TickerQ is built from three cooperating layers:
+
+**Source generators.** When you annotate a method with `[TickerFunction]`, `TickerQ.SourceGenerator` emits a static registration table at compile time. There is no assembly scanning or reflection at runtime.
+
+**Persistence providers.** The scheduler reads pending jobs from whichever store you configure — EF Core or Redis. An in-memory fallback is included for local development. The persistence layer is pluggable; you extend your existing `DbContext` rather than introducing a separate database.
+
+**Background services.** `AddTickerQ()` registers a scheduler background service, a fallback checker, and an initializer. `UseTickerQ()` activates them and signals the initializer to seed and start polling. All I/O-bound startup work is deferred to `TickerQInitializerHostedService` so design-time tools (EF migrations, OpenAPI generators) never trigger database operations.
+
+## When to use TickerQ
+
+TickerQ is a good fit when you need:
+
+- Background jobs in an existing ASP.NET Core or generic host application without adding a separate message broker
+- AOT or trimming compatibility (NativeAOT, Blazor WASM, mobile)
+- A persistence-backed scheduler that reuses your existing database
+- A built-in monitoring dashboard without a paid plan
+- Distributed scheduling across multiple application instances
+
+If you need a full message queue with fan-out, consumer groups, and complex routing, a dedicated broker (RabbitMQ, Azure Service Bus, etc.) may be a better fit. TickerQ focuses on scheduled job execution, not general-purpose messaging.
+
+## Explore
+
+<CardGroup cols={2}>
+  <Card title="Quick start" icon="rocket" href="/quickstart">
+    Get a working scheduler running in under 5 minutes.
+  </Card>
+  <Card title="Ticker functions" icon="function" href="/concepts/ticker-functions">
+    Learn how job functions are defined, discovered, and invoked.
+  </Card>
+  <Card title="EF Core persistence" icon="database" href="/persistence/ef-core">
+    Connect PostgreSQL, SQL Server, SQLite, or MySQL as your persistence backend.
+  </Card>
+  <Card title="Dashboard" icon="chart-line" href="/dashboard/setup">
+    Set up the real-time SignalR monitoring dashboard.
+  </Card>
+</CardGroup>
+
+<Note>
+  All TickerQ packages are versioned and released together. Always keep every TickerQ package in your project on the same version.
+</Note>

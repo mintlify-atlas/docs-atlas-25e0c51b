@@ -1,0 +1,247 @@
+---
+title: "Entities"
+description: "Reference for all TickerQ entity classes used to define and configure scheduled jobs."
+---
+
+TickerQ uses a hierarchy of entity classes to represent scheduled jobs. All entities inherit from `BaseTickerEntity`. Fields marked as **internal** are managed by TickerQ and should not be set by application code.
+
+---
+
+## BaseTickerEntity
+
+The root base class for all ticker entities. Both `TimeTickerEntity` and `CronTickerEntity` inherit from it.
+
+<ResponseField name="Id" type="Guid" required>
+  Unique identifier for the ticker. Defaults to `Guid.NewGuid()` on construction.
+</ResponseField>
+
+<ResponseField name="Function" type="string" required>
+  The name of the registered handler function this ticker is bound to.
+</ResponseField>
+
+<ResponseField name="Description" type="string">
+  Optional human-readable description of what this ticker does.
+</ResponseField>
+
+<ResponseField name="InitIdentifier" type="string">
+  **Internal.** Set by TickerQ to identify tickers registered at startup via code-based initialization.
+</ResponseField>
+
+<ResponseField name="CreatedAt" type="DateTime">
+  **Internal.** UTC timestamp of when the ticker was first persisted.
+</ResponseField>
+
+<ResponseField name="UpdatedAt" type="DateTime">
+  **Internal.** UTC timestamp of the most recent update to the ticker.
+</ResponseField>
+
+---
+
+## TimeTickerEntity
+
+Represents a one-shot job that runs at a specific point in time. The non-generic `TimeTickerEntity` is a concrete subclass of `TimeTickerEntity<TimeTickerEntity>` and is suitable for most use cases.
+
+Extends `BaseTickerEntity`.
+
+### User-facing fields
+
+<ResponseField name="Request" type="byte[]">
+  Serialized payload passed to the handler at execution time. Use this to carry job-specific input data.
+</ResponseField>
+
+<ResponseField name="ExecutionTime" type="DateTime?">
+  The UTC time at which TickerQ will execute this job.
+</ResponseField>
+
+<ResponseField name="Retries" type="int" default="0">
+  Maximum number of retry attempts if the job fails. Set `RetryIntervals` to control timing between retries.
+</ResponseField>
+
+<ResponseField name="RetryIntervals" type="int[]">
+  Delay in seconds between each retry attempt. The array is indexed by attempt number. If the array is shorter than `Retries`, the last value is reused.
+
+  ```csharp RetryIntervals example
+  // Retry after 30s, then 60s, then 120s
+  RetryIntervals = new[] { 30, 60, 120 }
+  ```
+</ResponseField>
+
+<ResponseField name="Children" type="ICollection<TTicker>">
+  Child tickers that will run after this ticker, according to their individual `RunCondition`. Use this to build job chains.
+</ResponseField>
+
+<ResponseField name="RunCondition" type="RunCondition?">
+  Determines when this ticker runs relative to its parent. Only relevant when this ticker is a child of another ticker. See [RunCondition](/api/enums#runcondition).
+</ResponseField>
+
+### Internal fields
+
+These fields are read-only from application code. TickerQ sets them automatically.
+
+<ResponseField name="Status" type="TickerStatus">
+  **Internal.** Current lifecycle state of the ticker. See [TickerStatus](/api/enums#tickerstatus).
+</ResponseField>
+
+<ResponseField name="LockHolder" type="string">
+  **Internal.** Identifier of the worker instance that has claimed this ticker for execution. Used to prevent duplicate execution in multi-node deployments.
+</ResponseField>
+
+<ResponseField name="LockedAt" type="DateTime?">
+  **Internal.** UTC timestamp of when a worker acquired the lock on this ticker.
+</ResponseField>
+
+<ResponseField name="ExecutedAt" type="DateTime?">
+  **Internal.** UTC timestamp of when execution began.
+</ResponseField>
+
+<ResponseField name="ExceptionMessage" type="string">
+  **Internal.** The exception message recorded if the job threw an unhandled exception.
+</ResponseField>
+
+<ResponseField name="SkippedReason" type="string">
+  **Internal.** Human-readable reason explaining why the ticker was skipped, if applicable.
+</ResponseField>
+
+<ResponseField name="ElapsedTime" type="long">
+  **Internal.** Execution duration in milliseconds.
+</ResponseField>
+
+<ResponseField name="RetryCount" type="int">
+  **Internal.** Current retry attempt number. Incremented by TickerQ on each retry.
+</ResponseField>
+
+<ResponseField name="ParentId" type="Guid?">
+  **Internal.** The `Id` of the parent ticker, if this ticker is part of a chain.
+</ResponseField>
+
+<ResponseField name="Parent" type="TTicker">
+  **Internal.** Navigation property to the parent ticker entity. Excluded from JSON serialization.
+</ResponseField>
+
+```csharp TimeTickerEntity example
+var ticker = new TimeTickerEntity
+{
+    Function = "process-order",
+    ExecutionTime = DateTime.UtcNow.AddSeconds(30),
+    Retries = 3,
+    RetryIntervals = new[] { 10, 30, 60 },
+    Children = new List<TimeTickerEntity>
+    {
+        new TimeTickerEntity
+        {
+            Function = "send-confirmation-email",
+            RunCondition = RunCondition.OnSuccess
+        },
+        new TimeTickerEntity
+        {
+            Function = "notify-failure-team",
+            RunCondition = RunCondition.OnFailure
+        }
+    }
+};
+```
+
+---
+
+## CronTickerEntity
+
+Represents a recurring job driven by a cron expression. Extends `BaseTickerEntity`.
+
+Each time a `CronTickerEntity` fires, TickerQ creates a `CronTickerOccurrenceEntity` record to track that individual execution.
+
+<ResponseField name="Expression" type="string" required>
+  Standard cron expression defining the schedule (e.g., `"0 9 * * MON-FRI"` for weekdays at 9 AM). Supports 5-part and 6-part (with seconds) expressions.
+</ResponseField>
+
+<ResponseField name="Request" type="byte[]">
+  Serialized payload passed to the handler at each occurrence.
+</ResponseField>
+
+<ResponseField name="Retries" type="int" default="0">
+  Maximum number of retry attempts per occurrence if the job fails.
+</ResponseField>
+
+<ResponseField name="RetryIntervals" type="int[]">
+  Delay in seconds between retry attempts for each occurrence.
+</ResponseField>
+
+<ResponseField name="IsEnabled" type="bool" default="true">
+  When `false`, TickerQ will not schedule new occurrences for this cron job. Existing in-progress occurrences are unaffected. Use `UpdateAsync` to toggle this field.
+</ResponseField>
+
+```csharp CronTickerEntity example
+var cron = new CronTickerEntity
+{
+    Function = "generate-monthly-report",
+    Expression = "0 6 1 * *", // 6 AM on the 1st of every month
+    Retries = 2,
+    RetryIntervals = new[] { 300, 600 }, // 5 min, then 10 min
+    IsEnabled = true
+};
+```
+
+---
+
+## CronTickerOccurrenceEntity
+
+TickerQ creates one `CronTickerOccurrenceEntity<TCronTicker>` record for each individual run of a `CronTickerEntity`. This allows per-occurrence tracking of status, timing, and errors without modifying the parent cron definition.
+
+<ResponseField name="Id" type="Guid">
+  Unique identifier for this occurrence.
+</ResponseField>
+
+<ResponseField name="CronTickerId" type="Guid">
+  Foreign key referencing the parent `CronTickerEntity`.
+</ResponseField>
+
+<ResponseField name="CronTicker" type="TCronTicker">
+  Navigation property to the parent cron ticker entity.
+</ResponseField>
+
+<ResponseField name="ExecutionTime" type="DateTime">
+  The scheduled UTC time for this occurrence.
+</ResponseField>
+
+<ResponseField name="Status" type="TickerStatus">
+  Current lifecycle state of this occurrence. See [TickerStatus](/api/enums#tickerstatus).
+</ResponseField>
+
+<ResponseField name="LockHolder" type="string">
+  Identifier of the worker that claimed this occurrence.
+</ResponseField>
+
+<ResponseField name="LockedAt" type="DateTime?">
+  UTC timestamp of when a worker acquired the lock.
+</ResponseField>
+
+<ResponseField name="ExecutedAt" type="DateTime?">
+  UTC timestamp of when execution began.
+</ResponseField>
+
+<ResponseField name="ElapsedTime" type="long">
+  Execution duration in milliseconds.
+</ResponseField>
+
+<ResponseField name="RetryCount" type="int">
+  Number of retry attempts made for this occurrence.
+</ResponseField>
+
+<ResponseField name="ExceptionMessage" type="string">
+  Exception message recorded if this occurrence threw an unhandled error.
+</ResponseField>
+
+<ResponseField name="SkippedReason" type="string">
+  Reason this occurrence was skipped, if applicable.
+</ResponseField>
+
+<ResponseField name="CreatedAt" type="DateTime">
+  UTC timestamp of when this occurrence record was created.
+</ResponseField>
+
+<ResponseField name="UpdatedAt" type="DateTime">
+  UTC timestamp of the most recent update to this occurrence record.
+</ResponseField>
+
+<Note>
+  Do not create or modify `CronTickerOccurrenceEntity` records directly. They are managed entirely by TickerQ.
+</Note>

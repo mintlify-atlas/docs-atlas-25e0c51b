@@ -1,0 +1,112 @@
+---
+title: "Redis"
+description: "Distributed job persistence and multi-node coordination using StackExchange.Redis."
+---
+
+TickerQ's Redis integration stores jobs in Redis and adds automatic multi-node coordination. Each node in your cluster tracks its liveness through heartbeats, and any node can detect and recover jobs left behind by a failed peer.
+
+## When to use Redis vs EF Core
+
+| | Redis | EF Core |
+|---|---|---|
+| Multi-node coordination | Yes — built-in heartbeats | No |
+| Persistent across restarts | Yes | Yes |
+| Requires a relational database | No | Yes |
+| AOT / trimming support | Yes (with `JsonSerializerContext`) | Yes |
+
+Use Redis when you run multiple instances of your application and need jobs distributed across them without manual coordination.
+
+## Installation
+
+```bash
+dotnet add package TickerQ.Caching.StackExchangeRedis
+```
+
+## Setup
+
+Call `AddStackExchangeRedis` inside `AddTickerQ` and provide at minimum a connection string:
+
+```csharp Program.cs
+using TickerQ.DependencyInjection;
+using TickerQ.Caching.StackExchangeRedis.DependencyInjection;
+
+builder.Services.AddTickerQ(options =>
+{
+    options.AddStackExchangeRedis(redis =>
+    {
+        redis.Configuration = "localhost:6379";
+        redis.InstanceName = "myapp:";
+    });
+});
+
+var app = builder.Build();
+app.UseTickerQ();
+app.Run();
+```
+
+## Configuration options
+
+`AddStackExchangeRedis` receives an `Action<TickerQRedisOptionBuilder>`. `TickerQRedisOptionBuilder` extends `RedisCacheOptions` from `Microsoft.Extensions.Caching.StackExchangeRedis` and adds the following fields:
+
+<ResponseField name="Configuration" type="string">
+  The Redis connection string (e.g. `"localhost:6379"`). Mutually exclusive with `ConfigurationOptions`. At least one must be provided.
+</ResponseField>
+
+<ResponseField name="ConfigurationOptions" type="StackExchange.Redis.ConfigurationOptions">
+  A fully constructed `ConfigurationOptions` object for advanced Redis configuration. When set, takes precedence over `Configuration`.
+</ResponseField>
+
+<ResponseField name="InstanceName" type="string" default="tickerq:">
+  Key prefix applied to every Redis key written by TickerQ. Defaults to `"tickerq:"`.
+</ResponseField>
+
+<ResponseField name="NodeHeartbeatInterval" type="TimeSpan" default="TimeSpan.FromMinutes(1)">
+  How often each node broadcasts its heartbeat to Redis. Defaults to 1 minute. The Redis TTL for heartbeat keys is set to this interval plus 20 seconds, giving nodes a small grace window before they are considered dead.
+</ResponseField>
+
+<ResponseField name="JsonSerializerContext" type="JsonSerializerContext">
+  An optional source-generated `JsonSerializerContext` for AOT / trimming compatibility. When provided, TickerQ uses it for trimming-safe JSON serialization of ticker entities. The context must include `[JsonSerializable]` attributes for your `TTimeTicker`, `TCronTicker`, and `CronTickerOccurrenceEntity<TCronTicker>` types.
+</ResponseField>
+
+### Using `ConfigurationOptions` for advanced Redis settings
+
+```csharp Program.cs
+using StackExchange.Redis;
+using TickerQ.DependencyInjection;
+using TickerQ.Caching.StackExchangeRedis.DependencyInjection;
+
+builder.Services.AddTickerQ(options =>
+{
+    options.AddStackExchangeRedis(redis =>
+    {
+        redis.ConfigurationOptions = new ConfigurationOptions
+        {
+            EndPoints = { "redis-primary:6379", "redis-replica:6379" },
+            Password = "secret",
+            Ssl = true,
+            AbortOnConnectFail = false,
+        };
+        redis.InstanceName = "myapp:";
+        redis.NodeHeartbeatInterval = TimeSpan.FromSeconds(30);
+    });
+});
+```
+
+## Multi-node coordination
+
+When you run multiple instances of your application, each node registers itself in Redis under the key `nodes:registry` and then writes a heartbeat key (`hb:<nodeId>`) at every `NodeHeartbeatInterval`.
+
+`NodeHeartBeatBackgroundService` runs as a hosted service on every node and:
+
+1. Calls `NotifyNodeAliveAsync` on startup to register the node and write its first heartbeat.
+2. Waits for the next timer tick (`NodeHeartbeatInterval`).
+3. Reads the node registry from Redis and checks which nodes have missing heartbeat keys.
+4. For each dead node, calls `IInternalTickerManager.ReleaseDeadNodeResources` to unlock any jobs that were in-flight on that node.
+5. Removes dead nodes from the registry.
+6. Writes a fresh heartbeat for the current node and repeats.
+
+The heartbeat TTL is `NodeHeartbeatInterval + 20 seconds`. A node is declared dead only after its TTL has fully expired, so transient Redis latency does not trigger false positives.
+
+<Note>
+  All nodes share the same Redis instance. Dead-node cleanup is performed by whichever live node detects the missing heartbeat first — no leader election is required.
+</Note>

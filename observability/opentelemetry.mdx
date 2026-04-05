@@ -1,0 +1,203 @@
+---
+title: "OpenTelemetry"
+description: "Instrument TickerQ job execution with OpenTelemetry distributed tracing and structured ILogger logging."
+---
+
+TickerQ ships a dedicated OpenTelemetry instrumentation package that emits `Activity` spans for every job lifecycle event. The same package also writes structured logs via `ILogger`, so you get both traces and logs with a single integration.
+
+## Installation
+
+<Steps>
+  <Step title="Install the package">
+
+```bash
+dotnet add package TickerQ.Instrumentation.OpenTelemetry
+```
+
+  </Step>
+  <Step title="Add to your TickerQ registration">
+
+Call `AddOpenTelemetryInstrumentation()` on your TickerQ builder:
+
+```csharp Program.cs
+builder.Services.AddTickerQ(options =>
+{
+    // ... your TickerQ configuration
+})
+.UseEntityFrameworkStore<AppDbContext>()
+.AddOpenTelemetryInstrumentation();
+```
+
+  </Step>
+  <Step title="Wire up the OpenTelemetry SDK">
+
+Register the TickerQ activity source with your OpenTelemetry tracing pipeline:
+
+```csharp Program.cs
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing
+        .AddSource("TickerQ")
+        .AddOtlpExporter());
+```
+
+The activity source name is **`"TickerQ"`** (version `"1.0.0"`). You must add this source explicitly or no spans will be exported.
+
+  </Step>
+</Steps>
+
+## What is traced
+
+`AddOpenTelemetryInstrumentation()` replaces the default logger-only instrumentation with an implementation that creates an `Activity` for every significant job event.
+
+### Activity names
+
+| Activity name | When emitted |
+|---|---|
+| `<function-name>` | Job execution starts (the activity name is the registered function name) |
+| `tickerq.job.enqueued` | A job is enqueued |
+| `tickerq.job.completed` | A job finishes (success or failure) |
+| `tickerq.job.failed` | A job throws an unhandled exception |
+| `tickerq.job.cancelled` | A job is cancelled |
+| `tickerq.job.skipped` | A job is skipped |
+| `tickerq.seeding.started` | Data seeding begins |
+| `tickerq.seeding.completed` | Data seeding finishes |
+| `tickerq.job_request_serialization.failed` | Job request payload cannot be deserialized |
+
+### Activity tags
+
+Every span is annotated with tags that let you filter and group traces in your backend:
+
+<AccordionGroup>
+  <Accordion title="Job execution span tags">
+
+| Tag | Value |
+|---|---|
+| `tickerq.job.id` | Job GUID |
+| `tickerq.job.type` | `TimeTicker` or `CronTicker` |
+| `tickerq.job.function` | Registered function name |
+| `tickerq.job.priority` | Configured priority |
+| `tickerq.job.machine` | Node identifier of the executing host |
+| `tickerq.job.retries` | Retry count at execution time |
+| `tickerq.job.parent_id` | Parent job ID (chained jobs only) |
+| `tickerq.job.run_condition` | Run condition (chained time tickers only) |
+
+  </Accordion>
+  <Accordion title="Failure span tags">
+
+When a job fails, the span status is set to `Error` and these additional tags are written:
+
+| Tag | Value |
+|---|---|
+| `tickerq.job.error_type` | Exception class name |
+| `tickerq.job.error_message` | Exception message |
+| `tickerq.job.error_stack_trace` | Full stack trace |
+| `tickerq.job.retry_count` | Retry count at the time of failure |
+
+  </Accordion>
+  <Accordion title="Completion span tags">
+
+| Tag | Value |
+|---|---|
+| `tickerq.job.execution_time_ms` | Wall-clock execution time in milliseconds |
+| `tickerq.job.success` | `true` or `false` |
+
+Activity status is set to `Ok` on success and `Error` on failure.
+
+  </Accordion>
+  <Accordion title="Enqueue span tags">
+
+| Tag | Value |
+|---|---|
+| `tickerq.job.id` | Job GUID |
+| `tickerq.job.type` | Job type string |
+| `tickerq.job.function` | Function name |
+| `tickerq.job.enqueued_from` | Caller location (file, method, line) |
+
+  </Accordion>
+</AccordionGroup>
+
+## ILogger logging
+
+In addition to OpenTelemetry spans, the instrumentation writes structured log messages through `ILogger` for every event. These logs flow through your application's standard logging pipeline (console, Serilog, Application Insights, etc.) without any extra configuration.
+
+```
+info: TickerQ Job enqueued: TimeTicker - SendWelcomeEmail (3fa85f64...) from UserService.cs:42
+info: TickerQ Job started: TimeTicker - SendWelcomeEmail (3fa85f64...)
+info: TickerQ Job completed: SendWelcomeEmail (3fa85f64...) in 123ms - Success: True
+```
+
+<Note>
+You do not need to configure anything extra to get ILogger output. It is always active alongside the OpenTelemetry tracing.
+</Note>
+
+## Complete setup example
+
+```csharp Program.cs
+using OpenTelemetry.Trace;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// TickerQ with OpenTelemetry instrumentation
+builder.Services.AddTickerQ(options =>
+{
+    options.SetMaxConcurrency(10);
+    options.SetNodeIdentifier(Environment.MachineName);
+})
+.UseEntityFrameworkStore<AppDbContext>()
+.AddOpenTelemetryInstrumentation();
+
+// OpenTelemetry SDK — add the TickerQ source
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing
+        .AddSource("TickerQ")          // required
+        .AddAspNetCoreInstrumentation()
+        .AddOtlpExporter(otlp =>
+        {
+            otlp.Endpoint = new Uri("http://localhost:4317");
+        }));
+
+var app = builder.Build();
+app.UseTickerQ();
+app.Run();
+```
+
+<Tip>
+Set `OTEL_SERVICE_NAME` in your environment or call `.ConfigureResource(r => r.AddService("my-service"))` on the tracer provider to label spans with your service name in Jaeger, Tempo, or any other OTLP-compatible backend.
+</Tip>
+
+## Sending traces to common backends
+
+<CodeGroup>
+
+```csharp Jaeger (OTLP)
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing
+        .AddSource("TickerQ")
+        .AddOtlpExporter(otlp =>
+        {
+            // Jaeger OTLP gRPC endpoint
+            otlp.Endpoint = new Uri("http://localhost:4317");
+        }));
+```
+
+```csharp Zipkin
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing
+        .AddSource("TickerQ")
+        .AddZipkinExporter(zipkin =>
+        {
+            zipkin.Endpoint = new Uri("http://localhost:9411/api/v2/spans");
+        }));
+```
+
+```csharp Azure Monitor
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing
+        .AddSource("TickerQ")
+        .AddAzureMonitorTraceExporter(options =>
+        {
+            options.ConnectionString = builder.Configuration["APPLICATIONINSIGHTS_CONNECTION_STRING"];
+        }));
+```
+
+</CodeGroup>

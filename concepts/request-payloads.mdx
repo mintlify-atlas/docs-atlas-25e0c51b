@@ -1,0 +1,199 @@
+---
+title: "Request Payloads"
+description: "Pass strongly typed data to a ticker function at schedule time using the Request byte array and TickerFunctionContext<TRequest>."
+---
+
+A request payload is structured data you attach to a ticker when you schedule it. TickerQ stores the payload as a `byte[]` on the entity, then deserializes it for you inside the function. Payloads work identically for both time tickers and cron tickers.
+
+## Attaching a payload when scheduling
+
+Use `TickerHelper.CreateTickerRequest<T>` to serialize your data into the `Request` field:
+
+```csharp title="Schedule a job with a payload"
+await manager.AddAsync(new TimeTickerEntity
+{
+    Function      = "SendWelcomeEmail",
+    ExecutionTime = DateTime.UtcNow.AddSeconds(30),
+    Request       = TickerHelper.CreateTickerRequest(new WelcomeEmailRequest
+    {
+        UserId = 42,
+        Email  = "user@example.com"
+    })
+});
+```
+
+`CreateTickerRequest<T>` serializes `T` to UTF-8 JSON using `TickerHelper.RequestJsonSerializerOptions`. When GZip compression is enabled, it compresses the JSON before storing it.
+
+## Consuming a payload in a ticker function
+
+Declare your function with `TickerFunctionContext<TRequest>` instead of the plain `TickerFunctionContext`. TickerQ deserializes the payload and makes it available as `context.Request`:
+
+```csharp title="Jobs.cs — typed context"
+public class EmailJobs
+{
+    private readonly IEmailService _email;
+
+    public EmailJobs(IEmailService email) => _email = email;
+
+    [TickerFunction("SendWelcomeEmail")]
+    public async Task SendWelcomeEmailAsync(
+        TickerFunctionContext<WelcomeEmailRequest> context,
+        CancellationToken cancellationToken)
+    {
+        WelcomeEmailRequest request = context.Request;
+
+        await _email.SendAsync(request.Email, request.UserId, cancellationToken);
+    }
+}
+
+public record WelcomeEmailRequest(int UserId, string Email);
+```
+
+<Note>
+  `TickerFunctionContext<TRequest>` inherits from `TickerFunctionContext`, so all context properties (`Id`, `ScheduledFor`, `RetryCount`, `Type`, etc.) are available alongside `Request`.
+</Note>
+
+## Serialization
+
+### Default behavior
+
+By default, `TickerHelper.RequestJsonSerializerOptions` is a plain `new JsonSerializerOptions()` with no custom converters. Payloads are stored as UTF-8 JSON bytes.
+
+### Custom serialization options
+
+Configure the serializer through `ConfigureRequestJsonOptions` on the options builder:
+
+```csharp title="Program.cs — custom JSON options"
+builder.Services.AddTickerQ(options =>
+{
+    options.ConfigureRequestJsonOptions(json =>
+    {
+        json.PropertyNamingPolicy        = JsonNamingPolicy.CamelCase;
+        json.DefaultIgnoreCondition      = JsonIgnoreCondition.WhenWritingNull;
+        json.Converters.Add(new JsonStringEnumConverter());
+    });
+});
+```
+
+The same `JsonSerializerOptions` instance is used for both serialization (at schedule time) and deserialization (at execution time).
+
+## GZip compression
+
+For large payloads, enable compression to reduce database storage:
+
+```csharp title="Program.cs — enable GZip"
+builder.Services.AddTickerQ(options =>
+{
+    options.UseGZipCompression();
+});
+```
+
+When enabled, `TickerHelper.CreateTickerRequest<T>` compresses the serialized JSON and appends a 4-byte GZip signature. `TickerHelper.ReadTickerRequest<T>` detects the signature and decompresses automatically. You do not need to change your function code — the context hydration handles everything.
+
+<Warning>
+  Enable or disable compression consistently across all nodes in a cluster. Mixing compressed and uncompressed payloads in the same database will cause deserialization failures.
+</Warning>
+
+## AOT and source-generated serialization
+
+For applications using native AOT or trimming, provide a `JsonSerializerContext` that includes your request types:
+
+<Steps>
+  <Step title="Define a JsonSerializerContext">
+    ```csharp title="AppJsonContext.cs"
+    using System.Text.Json.Serialization;
+
+    [JsonSerializable(typeof(WelcomeEmailRequest))]
+    [JsonSerializable(typeof(PaymentRequest))]
+    public partial class AppJsonContext : JsonSerializerContext { }
+    ```
+  </Step>
+  <Step title="Register it in the options">
+    ```csharp title="Program.cs"
+    builder.Services.AddTickerQ(options =>
+    {
+        options.ConfigureRequestJsonOptions(json =>
+        {
+            json.TypeInfoResolverChain.Add(AppJsonContext.Default);
+        });
+    });
+    ```
+  </Step>
+  <Step title="Use typed context in your function">
+    ```csharp title="Jobs.cs"
+    [TickerFunction("SendWelcomeEmail")]
+    public async Task SendWelcomeEmailAsync(
+        TickerFunctionContext<WelcomeEmailRequest> context,
+        CancellationToken cancellationToken)
+    {
+        // context.Request is fully source-generated; no reflection used
+        await _email.SendAsync(context.Request.Email, cancellationToken);
+    }
+    ```
+  </Step>
+</Steps>
+
+## Full example
+
+<Tabs>
+  <Tab title="Scheduling">
+    ```csharp title="OrderController.cs"
+    public class OrderController(ITimeTickerManager<TimeTickerEntity> manager)
+    {
+        [HttpPost("{orderId}/confirm")]
+        public async Task<IActionResult> ConfirmOrder(Guid orderId)
+        {
+            await manager.AddAsync(new TimeTickerEntity
+            {
+                Function      = "ProcessOrder",
+                ExecutionTime = DateTime.UtcNow.AddSeconds(5),
+                Retries       = 2,
+                RetryIntervals = [30, 60],
+                Request       = TickerHelper.CreateTickerRequest(new OrderRequest
+                {
+                    OrderId    = orderId,
+                    Priority   = "standard"
+                })
+            });
+
+            return Accepted();
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Ticker function">
+    ```csharp title="OrderJobs.cs"
+    public class OrderJobs(IOrderService orders, ILogger<OrderJobs> logger)
+    {
+        [TickerFunction("ProcessOrder")]
+        public async Task ProcessOrderAsync(
+            TickerFunctionContext<OrderRequest> context,
+            CancellationToken cancellationToken)
+        {
+            logger.LogInformation(
+                "Processing order {OrderId} (attempt {Retry})",
+                context.Request.OrderId,
+                context.RetryCount);
+
+            await orders.ProcessAsync(context.Request.OrderId, cancellationToken);
+        }
+    }
+
+    public record OrderRequest(Guid OrderId, string Priority);
+    ```
+  </Tab>
+</Tabs>
+
+## Reading the raw payload
+
+If you need to inspect the payload outside of a ticker function, use `TickerHelper.ReadTickerRequest<T>` or `TickerHelper.ReadTickerRequestAsString` directly:
+
+```csharp title="Read payload manually"
+// Deserialize to a typed object
+var request = TickerHelper.ReadTickerRequest<OrderRequest>(ticker.Request);
+
+// Read as raw JSON string (useful for logging or debugging)
+var json = TickerHelper.ReadTickerRequestAsString(ticker.Request);
+```
+
+Both methods handle GZip decompression automatically when `UseGZipCompression()` is enabled.

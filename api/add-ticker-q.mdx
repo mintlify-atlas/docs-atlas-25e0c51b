@@ -1,0 +1,205 @@
+---
+title: "AddTickerQ"
+description: "Register TickerQ services with the dependency injection container."
+---
+
+`AddTickerQ` is an `IServiceCollection` extension method that registers all TickerQ services, background workers, and persistence infrastructure with the .NET dependency injection container. Call it inside `Program.cs` (or `Startup.cs`) before `builder.Build()`.
+
+## Method signatures
+
+```csharp
+// Default overload — uses built-in TimeTickerEntity and CronTickerEntity
+IServiceCollection AddTickerQ(
+    this IServiceCollection services,
+    Action<TickerOptionsBuilder<TimeTickerEntity, CronTickerEntity>> optionsBuilder = null
+)
+
+// Generic overload — supply custom entity types
+IServiceCollection AddTickerQ<TTimeTicker, TCronTicker>(
+    this IServiceCollection services,
+    Action<TickerOptionsBuilder<TTimeTicker, TCronTicker>> optionsBuilder = null
+)
+where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
+where TCronTicker : CronTickerEntity, new()
+```
+
+## Parameters
+
+<ParamField path="services" type="IServiceCollection" required>
+  The service collection to register TickerQ services into.
+</ParamField>
+
+<ParamField path="optionsBuilder" type="Action<TickerOptionsBuilder<TTimeTicker, TCronTicker>>">
+  Optional configuration delegate. When omitted, TickerQ starts with in-memory persistence and default scheduler settings.
+</ParamField>
+
+<ParamField path="TTimeTicker" type="generic">
+  Custom time ticker entity type. Must extend `TimeTickerEntity<TTimeTicker>` and have a parameterless constructor. Defaults to `TimeTickerEntity`.
+</ParamField>
+
+<ParamField path="TCronTicker" type="generic">
+  Custom cron ticker entity type. Must extend `CronTickerEntity` and have a parameterless constructor. Defaults to `CronTickerEntity`.
+</ParamField>
+
+---
+
+## TickerOptionsBuilder methods
+
+### Persistence and integrations
+
+<ParamField path="AddOperationalStore()" type="method">
+  Configures EF Core as the persistence provider. See [EF Core persistence](/persistence/ef-core) for setup details.
+</ParamField>
+
+<ParamField path="AddStackExchangeRedis()" type="method">
+  Configures Redis (StackExchange.Redis) as the persistence provider. See [Redis persistence](/persistence/redis) for setup details.
+</ParamField>
+
+<ParamField path="AddDashboard()" type="method">
+  Registers the TickerQ dashboard middleware. See [Dashboard setup](/dashboard/setup) for configuration options.
+</ParamField>
+
+<ParamField path="AddOpenTelemetryInstrumentation()" type="method">
+  Registers OpenTelemetry tracing instrumentation for TickerQ job executions. See [OpenTelemetry](/observability/opentelemetry) for details.
+</ParamField>
+
+### Scheduler configuration
+
+<ParamField path="ConfigureScheduler(Action<SchedulerOptionsBuilder> schedulerOptionsBuilder)" type="method">
+  Configures low-level scheduler properties such as concurrency, polling interval, and node identity. See [SchedulerOptionsBuilder](#scheduleroptionsbuilder-properties) below.
+</ParamField>
+
+<ParamField path="MinPollingInterval" type="TimeSpan" default="TimeSpan.FromSeconds(1)">
+  Shortcut property that sets the minimum interval between database polls. Equivalent to setting `SchedulerOptionsBuilder.MinPollingInterval` inside `ConfigureScheduler`.
+</ParamField>
+
+### Seeding
+
+<ParamField path="UseTickerSeeder(Func<ITimeTickerManager<TTimeTicker>, Task> timeSeeder)" type="method">
+  Registers a startup seeder that runs after the host starts, providing an `ITimeTickerManager` for seeding time-based jobs.
+</ParamField>
+
+<ParamField path="UseTickerSeeder(Func<ICronTickerManager<TCronTicker>, Task> cronSeeder)" type="method">
+  Registers a startup seeder that runs after the host starts, providing an `ICronTickerManager` for seeding cron jobs.
+</ParamField>
+
+<ParamField path="UseTickerSeeder(timeSeeder, cronSeeder)" type="method">
+  Registers startup seeders for both time and cron tickers in a single call.
+</ParamField>
+
+<ParamField path="IgnoreSeedDefinedCronTickers()" type="method">
+  Prevents TickerQ from automatically seeding cron tickers that are defined in code via `[TickerFunction]` attributes at startup.
+</ParamField>
+
+<ParamField path="SkipStaleCronOccurrencesOnStartup(TimeSpan? threshold = null)" type="method">
+  Marks idle/queued cron occurrences whose scheduled time is older than `threshold` as `Skipped` on startup. Prevents duplicate executions after a restart. Defaults to 5 seconds when called without an argument. Disabled by default.
+</ParamField>
+
+### Error handling and compression
+
+<ParamField path="SetExceptionHandler<THandler>()" type="method">
+  Registers a custom exception handler that is invoked when a job throws. `THandler` must implement `ITickerExceptionHandler`.
+</ParamField>
+
+<ParamField path="UseGZipCompression()" type="method">
+  Enables GZip compression for ticker request payloads stored in the persistence layer. Useful when job request objects are large. By default, payloads are stored as plain UTF-8 JSON.
+</ParamField>
+
+<ParamField path="ConfigureRequestJsonOptions(Action<JsonSerializerOptions> configure)" type="method">
+  Customizes the `JsonSerializerOptions` used when serializing and deserializing ticker request payloads.
+</ParamField>
+
+### Background services
+
+<ParamField path="DisableBackgroundServices()" type="method">
+  Omits the scheduler and worker background services from the DI container. Only `ITimeTickerManager` and `ICronTickerManager` are registered. Use this in applications that queue jobs but delegate processing to a separate worker process.
+</ParamField>
+
+---
+
+## SchedulerOptionsBuilder properties
+
+Pass these inside `ConfigureScheduler(options => { ... })`.
+
+<ResponseField name="NodeIdentifier" type="string" default="Environment.MachineName">
+  A unique string that identifies this scheduler node. Used for distributed deployments to differentiate nodes in logs and dashboard views.
+</ResponseField>
+
+<ResponseField name="MaxConcurrency" type="int" default="Environment.ProcessorCount">
+  Maximum number of jobs that can execute concurrently across the scheduler's thread pool.
+</ResponseField>
+
+<ResponseField name="IdleWorkerTimeOut" type="TimeSpan" default="TimeSpan.FromMinutes(1)">
+  How long an idle worker thread waits before being reclaimed by the thread pool.
+</ResponseField>
+
+<ResponseField name="FallbackIntervalChecker" type="TimeSpan" default="TimeSpan.FromSeconds(30)">
+  Interval at which the fallback background service re-scans for missed or stuck jobs.
+</ResponseField>
+
+<ResponseField name="MinPollingInterval" type="TimeSpan" default="TimeSpan.FromSeconds(1)">
+  Minimum time between consecutive database polls. Prevents tight polling loops when no jobs are due.
+</ResponseField>
+
+<ResponseField name="SchedulerTimeZone" type="TimeZoneInfo" default="TimeZoneInfo.Local">
+  The time zone used when evaluating cron expressions. Set to `TimeZoneInfo.Utc` for UTC-based schedules.
+</ResponseField>
+
+<ResponseField name="StaleCronOccurrenceThreshold" type="TimeSpan" default="TimeSpan.Zero">
+  Set by `SkipStaleCronOccurrencesOnStartup()`. Occurrences older than this threshold are marked `Skipped` on startup. `TimeSpan.Zero` disables the feature.
+</ResponseField>
+
+---
+
+## Complete registration example
+
+```csharp Program.cs
+using TickerQ.DependencyInjection;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddTickerQ(options =>
+{
+    options
+        .AddOperationalStore() // or .AddStackExchangeRedis()
+        .AddDashboard()
+        .ConfigureScheduler(scheduler =>
+        {
+            scheduler.NodeIdentifier = "worker-1";
+            scheduler.MaxConcurrency = 8;
+            scheduler.IdleWorkerTimeOut = TimeSpan.FromMinutes(2);
+            scheduler.FallbackIntervalChecker = TimeSpan.FromSeconds(30);
+            scheduler.MinPollingInterval = TimeSpan.FromSeconds(1);
+            scheduler.SchedulerTimeZone = TimeZoneInfo.Utc;
+        })
+        .UseTickerSeeder(async timeManager =>
+        {
+            await timeManager.AddAsync(new TimeTickerEntity
+            {
+                Function = "SendWelcomeEmail",
+                ExecutionTime = DateTime.UtcNow.AddMinutes(5)
+            });
+        })
+        .SetExceptionHandler<MyExceptionHandler>()
+        .SkipStaleCronOccurrencesOnStartup(TimeSpan.FromSeconds(10))
+        .UseGZipCompression();
+});
+
+var app = builder.Build();
+
+app.UseTickerQ();
+app.Run();
+```
+
+### Generic overload with custom entity types
+
+```csharp Program.cs
+builder.Services.AddTickerQ<MyTimeTicker, MyCronTicker>(options =>
+{
+    options.AddOperationalStore();
+});
+```
+
+<Note>
+  In-memory persistence is used automatically when neither `AddOperationalStore()` nor `AddStackExchangeRedis()` is called. In-memory storage does not survive application restarts and is suitable for development only.
+</Note>

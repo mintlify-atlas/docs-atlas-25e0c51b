@@ -1,0 +1,164 @@
+---
+title: "Time Tickers"
+description: "One-off scheduled jobs that run at a specific UTC time, with support for retries, batching, and job chaining."
+---
+
+A time ticker is a single scheduled job. You set an `ExecutionTime` and TickerQ dispatches the job as close to that moment as possible. Once the job completes (or fails permanently), the ticker is done — it does not repeat.
+
+## `TimeTickerEntity` fields
+
+`TimeTickerEntity` extends `BaseTickerEntity` and adds scheduling, retry, and chaining fields.
+
+### Writable fields (set when scheduling)
+
+| Field | Type | Description |
+|---|---|---|
+| `Function` | `string` | Name of the ticker function to invoke (must match a `[TickerFunction]` name). |
+| `Description` | `string` | Optional free-text label stored alongside the job. |
+| `ExecutionTime` | `DateTime?` | UTC time the job should run. |
+| `Request` | `byte[]` | Serialized payload passed to the function. See [Request Payloads](/concepts/request-payloads). |
+| `Retries` | `int` | Number of automatic retries on failure. `0` means no retries. |
+| `RetryIntervals` | `int[]` | Delay in seconds between each retry. If shorter than `Retries`, the last interval is reused. |
+| `RunCondition` | `RunCondition?` | When set, this ticker only runs after its parent reaches the specified state. See [Job Chaining](/concepts/job-chaining). |
+| `Children` | `ICollection<TTicker>` | Child tickers that depend on this one. |
+
+### Read-only fields (managed by TickerQ)
+
+| Field | Type | Description |
+|---|---|---|
+| `Id` | `Guid` | Unique identifier assigned on creation. |
+| `Status` | `TickerStatus` | Current lifecycle state. |
+| `LockHolder` | `string` | Node identifier of the worker currently executing the job. |
+| `LockedAt` | `DateTime?` | When the job was claimed by a worker. |
+| `ExecutedAt` | `DateTime?` | When execution finished. |
+| `ElapsedTime` | `long` | Wall-clock execution time in milliseconds. |
+| `RetryCount` | `int` | How many retries have occurred so far. |
+| `ExceptionMessage` | `string` | Last exception message if the job failed. |
+| `SkippedReason` | `string` | Reason the job was skipped (e.g. parent condition not met). |
+| `ParentId` | `Guid?` | Id of the parent ticker when this is a chained child. |
+| `CreatedAt` | `DateTime` | UTC creation timestamp. |
+| `UpdatedAt` | `DateTime` | UTC last-update timestamp. |
+
+## Job lifecycle (`TickerStatus`)
+
+```
+Idle → Queued → InProgress → Done
+                           → DueDone    (ran after its scheduled time)
+                           → Failed
+                           → Cancelled
+                           → Skipped
+```
+
+| Status | Meaning |
+|---|---|
+| `Idle` | Persisted but not yet claimed by the scheduler. |
+| `Queued` | Picked up by the scheduler, waiting to be dispatched to a worker. |
+| `InProgress` | A worker is currently executing the function. |
+| `Done` | Completed successfully and ran on time. |
+| `DueDone` | Completed successfully but ran after its scheduled `ExecutionTime`. |
+| `Failed` | The function threw an exception and all retries are exhausted. |
+| `Cancelled` | Cancelled via `context.RequestCancellation()` or an external signal. |
+| `Skipped` | Not executed because a `RunCondition` was not satisfied. |
+
+## Scheduling a time ticker
+
+Inject `ITimeTickerManager<TimeTickerEntity>` and call `AddAsync`:
+
+```csharp title="Program.cs — schedule a one-off job"
+app.MapPost("/send-welcome", async (
+    ITimeTickerManager<TimeTickerEntity> manager,
+    string userId) =>
+{
+    var result = await manager.AddAsync(new TimeTickerEntity
+    {
+        Function    = "SendWelcomeEmail",
+        ExecutionTime = DateTime.UtcNow.AddMinutes(1),
+        Request     = TickerHelper.CreateTickerRequest(new { UserId = userId })
+    });
+
+    return Results.Ok(result.Result.Id);
+});
+```
+
+`AddAsync` returns a `TickerResult<TimeTickerEntity>` containing the persisted entity (including its generated `Id`).
+
+### With retries
+
+```csharp title="Schedule with retry policy"
+await manager.AddAsync(new TimeTickerEntity
+{
+    Function      = "ProcessPayment",
+    ExecutionTime = DateTime.UtcNow.AddSeconds(10),
+    Retries       = 3,
+    RetryIntervals = [30, 60, 120]   // wait 30 s, then 60 s, then 120 s
+});
+```
+
+## Updating and deleting
+
+```csharp title="Update execution time"
+var ticker = result.Result;
+ticker.ExecutionTime = DateTime.UtcNow.AddHours(2);
+await manager.UpdateAsync(ticker);
+```
+
+```csharp title="Delete by Id"
+await manager.DeleteAsync(tickerId);
+```
+
+<Warning>
+  Updating a ticker that is already `InProgress` or in a terminal state (`Done`, `DueDone`, `Failed`, `Cancelled`, `Skipped`) may have no effect or cause inconsistencies. Check the `Status` field before updating.
+</Warning>
+
+## Batch operations
+
+All three write operations have batch counterparts that persist multiple entities in a single database round-trip.
+
+```csharp title="Batch scheduling"
+var jobs = Enumerable.Range(1, 50).Select(i => new TimeTickerEntity
+{
+    Function      = "SendNotification",
+    ExecutionTime = DateTime.UtcNow.AddSeconds(i * 5),
+    Request       = TickerHelper.CreateTickerRequest(new { Index = i })
+}).ToList();
+
+var batchResult = await manager.AddBatchAsync(jobs);
+```
+
+```csharp title="Batch delete"
+var ids = new List<Guid> { id1, id2, id3 };
+await manager.DeleteBatchAsync(ids);
+```
+
+| Method | Signature |
+|---|---|
+| `AddBatchAsync` | `Task<TickerResult<List<TTimeTicker>>> AddBatchAsync(List<TTimeTicker>, CancellationToken)` |
+| `UpdateBatchAsync` | `Task<TickerResult<List<TTimeTicker>>> UpdateBatchAsync(List<TTimeTicker>, CancellationToken)` |
+| `DeleteBatchAsync` | `Task<TickerResult<TTimeTicker>> DeleteBatchAsync(List<Guid>, CancellationToken)` |
+
+## Parent/child relationships
+
+A ticker can declare a `RunCondition` and a `ParentId` to form a dependency chain. TickerQ will hold the child in `Idle` state and only promote it once the parent reaches the required status.
+
+```csharp title="Chained jobs"
+// 1. Schedule the parent
+var parent = await manager.AddAsync(new TimeTickerEntity
+{
+    Function      = "ExportData",
+    ExecutionTime = DateTime.UtcNow.AddMinutes(5)
+});
+
+// 2. Schedule the child to run after the parent succeeds
+await manager.AddAsync(new TimeTickerEntity
+{
+    Function     = "EmailExportLink",
+    ExecutionTime = DateTime.UtcNow.AddMinutes(5),
+    RunCondition = RunCondition.OnSuccess,
+    Children     = new List<TimeTickerEntity>
+    {
+        new TimeTickerEntity { Id = parent.Result.Id }
+    }
+});
+```
+
+For the full set of `RunCondition` values and chaining patterns, see [Job Chaining](/concepts/job-chaining).

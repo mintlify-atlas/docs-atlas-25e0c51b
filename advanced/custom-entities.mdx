@@ -1,0 +1,216 @@
+---
+title: "Custom Entities"
+description: "Extend TimeTickerEntity and CronTickerEntity to add your own fields — such as TenantId or UserId — and wire them into TickerQ's type system."
+---
+
+By default TickerQ uses `TimeTickerEntity` and `CronTickerEntity` directly. You can subclass both to attach application-specific fields — for example a `TenantId`, a `UserId`, or a `Priority` label — without modifying the TickerQ internals.
+
+## Why extend entities
+
+<CardGroup cols={2}>
+  <Card title="Business context on every job" icon="tag">
+    Store which tenant, user, or department created a job so you can filter, audit, or report on it later.
+  </Card>
+  <Card title="Custom routing or filtering" icon="filter">
+    Add fields that control how your application processes jobs, without packing everything into the generic `Request` payload.
+  </Card>
+</CardGroup>
+
+## Extending TimeTickerEntity
+
+`TimeTickerEntity<T>` uses a self-referential generic so that parent/child relationships stay strongly typed. Your subclass must pass itself as the type argument.
+
+```csharp Entities/AppTimeTicker.cs
+using TickerQ.Utilities.Entities;
+
+public class AppTimeTicker : TimeTickerEntity<AppTimeTicker>
+{
+    public string TenantId { get; set; } = string.Empty;
+    public string CreatedByUserId { get; set; } = string.Empty;
+}
+```
+
+<Note>
+Custom entities must be **concrete classes** with a **public parameterless constructor**. The source generator and the persistence layer both instantiate them with `new()`.
+</Note>
+
+## Extending CronTickerEntity
+
+`CronTickerEntity` does not use a self-referential generic, so the inheritance is straightforward:
+
+```csharp Entities/AppCronTicker.cs
+using TickerQ.Utilities.Entities;
+
+public class AppCronTicker : CronTickerEntity
+{
+    public string TenantId { get; set; } = string.Empty;
+    public string OwnerEmail { get; set; } = string.Empty;
+}
+```
+
+## Registering custom entities
+
+Pass your entity types as generic arguments to `AddTickerQ`:
+
+```csharp Program.cs
+builder.Services.AddTickerQ<AppTimeTicker, AppCronTicker>(options =>
+{
+    // ...persistence and other options
+});
+```
+
+### With EF Core
+
+Use `UseTickerQDbContext` to register a `DbContext` that is already aware of your entity types. TickerQ replaces the EF Core model customizer automatically so your extra columns appear in the generated schema.
+
+<Steps>
+  <Step title="Create a DbContext">
+    ```csharp Data/AppDbContext.cs
+    using Microsoft.EntityFrameworkCore;
+    using TickerQ.EntityFrameworkCore;
+
+    public class AppDbContext : TickerQDbContext<AppTimeTicker, AppCronTicker>
+    {
+        public AppDbContext(DbContextOptions<AppDbContext> options)
+            : base(options) { }
+    }
+    ```
+  </Step>
+
+  <Step title="Register with TickerQ">
+    ```csharp Program.cs
+    builder.Services.AddTickerQ<AppTimeTicker, AppCronTicker>(options =>
+    {
+        options.UseEfCore(ef =>
+        {
+            ef.UseTickerQDbContext<AppDbContext, AppTimeTicker, AppCronTicker>(o =>
+                o.UseSqlServer(connectionString));
+        });
+    });
+    ```
+  </Step>
+
+  <Step title="Generate and apply a migration">
+    ```bash terminal
+    dotnet ef migrations add AddTenantFields
+    dotnet ef database update
+    ```
+  </Step>
+</Steps>
+
+### With an existing application DbContext
+
+If you prefer to use your existing `DbContext` rather than inherit from `TickerQDbContext`, use `UseApplicationDbContext` instead. TickerQ injects its own `IModelCustomizer` into that context so the ticker tables are configured automatically.
+
+```csharp Program.cs
+builder.Services.AddTickerQ<AppTimeTicker, AppCronTicker>(options =>
+{
+    options.UseEfCore(ef =>
+    {
+        ef.UseApplicationDbContext<ExistingAppDbContext, AppTimeTicker, AppCronTicker>();
+    });
+});
+```
+
+## Complete example
+
+The following example defines both custom entities, registers them, and uses the typed managers to enqueue jobs with tenant context.
+
+```csharp Entities/AppTimeTicker.cs
+using TickerQ.Utilities.Entities;
+
+public class AppTimeTicker : TimeTickerEntity<AppTimeTicker>
+{
+    public string TenantId { get; set; } = string.Empty;
+}
+```
+
+```csharp Entities/AppCronTicker.cs
+using TickerQ.Utilities.Entities;
+
+public class AppCronTicker : CronTickerEntity
+{
+    public string TenantId { get; set; } = string.Empty;
+}
+```
+
+```csharp Data/AppDbContext.cs
+using Microsoft.EntityFrameworkCore;
+using TickerQ.EntityFrameworkCore;
+
+public class AppDbContext : TickerQDbContext<AppTimeTicker, AppCronTicker>
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options)
+        : base(options) { }
+}
+```
+
+```csharp Program.cs
+builder.Services.AddTickerQ<AppTimeTicker, AppCronTicker>(options =>
+{
+    options.UseEfCore(ef =>
+    {
+        ef.UseTickerQDbContext<AppDbContext, AppTimeTicker, AppCronTicker>(o =>
+            o.UseSqlServer(builder.Configuration.GetConnectionString("Default")));
+    });
+});
+```
+
+```csharp Services/JobService.cs
+using TickerQ.Utilities.Interfaces.Managers;
+
+public class JobService(ITimeTickerManager<AppTimeTicker> timeMgr)
+{
+    public async Task ScheduleReportAsync(string tenantId, CancellationToken ct)
+    {
+        await timeMgr.AddAsync(new AppTimeTicker
+        {
+            Function     = "GenerateReport",
+            TenantId     = tenantId,
+            ExecutionTime = DateTime.UtcNow.AddHours(1),
+        }, ct);
+    }
+}
+```
+
+## Source generator integration
+
+The TickerQ source generator picks up `AppTimeTicker` and `AppCronTicker` automatically when they are passed to `AddTickerQ<TTimeTicker, TCronTicker>`. It generates the function attribute infrastructure and the function provider for your concrete types. No additional configuration is needed.
+
+<AccordionGroup>
+  <Accordion title="Base entity fields (inherited automatically)">
+    All custom entities inherit these fields from `BaseTickerEntity`:
+
+    | Field | Type | Description |
+    |---|---|---|
+    | `Id` | `Guid` | Primary key, auto-generated |
+    | `Function` | `string` | Name of the handler function to invoke |
+    | `Description` | `string` | Optional human-readable label |
+    | `InitIdentifier` | `string` | Set by TickerQ on creation (read-only) |
+    | `CreatedAt` | `DateTime` | UTC timestamp (read-only) |
+    | `UpdatedAt` | `DateTime` | UTC timestamp, updated by TickerQ (read-only) |
+  </Accordion>
+
+  <Accordion title="TimeTickerEntity fields (inherited by AppTimeTicker)">
+    | Field | Type | Description |
+    |---|---|---|
+    | `Status` | `TickerStatus` | Current lifecycle status (read-only) |
+    | `ExecutionTime` | `DateTime?` | Scheduled UTC time |
+    | `Request` | `byte[]` | Serialised job payload |
+    | `Retries` | `int` | Max retry attempts |
+    | `RetryIntervals` | `int[]` | Delays between retries in seconds |
+    | `RunCondition` | `RunCondition?` | Condition linking parent/child jobs |
+    | `ElapsedTime` | `long` | Execution duration in ms (read-only) |
+    | `ExceptionMessage` | `string` | Last exception text (read-only) |
+  </Accordion>
+
+  <Accordion title="CronTickerEntity fields (inherited by AppCronTicker)">
+    | Field | Type | Description |
+    |---|---|---|
+    | `Expression` | `string` | Cron expression (6-field, second precision) |
+    | `Request` | `byte[]` | Serialised job payload |
+    | `Retries` | `int` | Max retry attempts |
+    | `RetryIntervals` | `int[]` | Delays between retries in seconds |
+    | `IsEnabled` | `bool` | When `false`, occurrences are not generated |
+  </Accordion>
+</AccordionGroup>

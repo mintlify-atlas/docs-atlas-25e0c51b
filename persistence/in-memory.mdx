@@ -1,0 +1,81 @@
+---
+title: "In-Memory (Development)"
+description: "The default fallback persistence provider — suitable for development and testing only."
+---
+
+<Warning>
+  In-memory persistence is not suitable for production. Jobs are lost on every restart and cannot be shared across multiple application instances.
+</Warning>
+
+## Overview
+
+When you call `AddTickerQ` without configuring a persistence provider, TickerQ automatically falls back to `TickerInMemoryPersistenceProvider`. This requires no additional packages or infrastructure, which makes it useful for local development and unit testing.
+
+The fallback is registered using `TryAddSingleton`, so any real provider registered by `AddOperationalStore` or `AddStackExchangeRedis` takes precedence automatically.
+
+## Minimal setup
+
+No options are required. Call `AddTickerQ` with no operational store:
+
+```csharp Program.cs
+using TickerQ.DependencyInjection;
+
+builder.Services.AddTickerQ();
+
+var app = builder.Build();
+app.UseTickerQ();
+app.Run();
+```
+
+## Limitations
+
+| Limitation | Detail |
+|---|---|
+| Jobs lost on restart | All scheduled jobs exist only in process memory. A restart empties the queue. |
+| No multi-node support | Each instance has its own isolated store. Jobs do not replicate between instances. |
+| No dead-node recovery | There are no heartbeats or cleanup — dead-node logic from EF Core and Redis is not present. |
+
+## Switching to a real persistence provider
+
+Replace the in-memory fallback by adding `AddOperationalStore` (EF Core) or `AddStackExchangeRedis` (Redis) to the `AddTickerQ` call. The in-memory provider is then never registered.
+
+<Tabs>
+  <Tab title="EF Core">
+    ```csharp Program.cs
+    using TickerQ.DependencyInjection;
+    using TickerQ.EntityFrameworkCore.DbContextFactory;
+    using TickerQ.EntityFrameworkCore.DependencyInjection;
+
+    builder.Services.AddTickerQ(options =>
+    {
+        options.AddOperationalStore(efOptions =>
+        {
+            efOptions.UseTickerQDbContext<TickerQDbContext>(dbOptions =>
+            {
+                dbOptions.UseSqlite("Data Source=tickerq.db",
+                    b => b.MigrationsAssembly("MyApp"));
+            });
+        });
+    });
+    ```
+
+    See [EF Core](/persistence/ef-core) for full setup instructions.
+  </Tab>
+
+  <Tab title="Redis">
+    ```csharp Program.cs
+    using TickerQ.DependencyInjection;
+    using TickerQ.Caching.StackExchangeRedis.DependencyInjection;
+
+    builder.Services.AddTickerQ(options =>
+    {
+        options.AddStackExchangeRedis(redis =>
+        {
+            redis.Configuration = "localhost:6379";
+        });
+    });
+    ```
+
+    See [Redis](/persistence/redis) for full setup instructions.
+  </Tab>
+</Tabs>

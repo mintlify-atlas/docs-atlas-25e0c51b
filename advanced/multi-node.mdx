@@ -1,0 +1,176 @@
+---
+title: "Multi-Node Deployment"
+description: "Run multiple TickerQ instances against the same persistence backend with Redis-based coordination or EF Core optimistic locking."
+---
+
+Multiple TickerQ instances can point at the same persistence backend to share job processing across several machines or containers. Each instance competes for jobs using lock-based acquisition, so no job runs twice.
+
+## Node identity
+
+Every node announces itself with a `NodeIdentifier`. By default this is `Environment.MachineName`, which works well on bare-metal hosts but collides when containers share a hostname.
+
+```csharp Program.cs
+builder.Services.AddTickerQ<TimeTickerEntity, CronTickerEntity>(options =>
+{
+    options.ConfigureScheduler(scheduler =>
+    {
+        scheduler.NodeIdentifier = "worker-1"; // set an explicit, unique name
+    });
+});
+```
+
+<Tip>
+In Kubernetes or Docker Swarm, set `NodeIdentifier` from an environment variable such as `POD_NAME` or `HOSTNAME` so each replica gets a distinct identity automatically.
+</Tip>
+
+## Redis-based coordination
+
+The `TickerQ.Caching.StackExchangeRedis` package adds active cluster coordination on top of any persistence backend. It handles:
+
+- **Heartbeats** — each node writes a heartbeat key (`hb:<node>`) to Redis on every interval with a TTL of `NodeHeartbeatInterval + 20 seconds`.
+- **Node registry** — each node registers itself in a shared `nodes:registry` key.
+- **Dead-node detection** — on each heartbeat tick, surviving nodes read the registry and check for missing heartbeat keys. Nodes whose keys have expired are treated as dead.
+- **Resource release** — for every dead node found, the surviving node calls `ReleaseDeadNodeResources`, which unlocks any jobs the dead node had acquired so they can be retried.
+
+### Setup
+
+<Steps>
+  <Step title="Install the package">
+    ```bash terminal
+    dotnet add package TickerQ.Caching.StackExchangeRedis
+    ```
+  </Step>
+
+  <Step title="Register Redis coordination">
+    ```csharp Program.cs
+    builder.Services.AddTickerQ<TimeTickerEntity, CronTickerEntity>(options =>
+    {
+        options.ConfigureScheduler(scheduler =>
+        {
+            scheduler.NodeIdentifier = Environment.GetEnvironmentVariable("POD_NAME")
+                                       ?? Environment.MachineName;
+        });
+
+        options.AddStackExchangeRedis(redis =>
+        {
+            redis.Configuration = "localhost:6379";
+            redis.NodeHeartbeatInterval = TimeSpan.FromMinutes(1); // default
+        });
+    });
+    ```
+  </Step>
+
+  <Step title="Add a persistence backend">
+    Redis coordination works alongside any persistence layer. Use EF Core for durable job storage:
+
+    ```csharp Program.cs
+    builder.Services.AddTickerQ<TimeTickerEntity, CronTickerEntity>(options =>
+    {
+        options.ConfigureScheduler(scheduler =>
+        {
+            scheduler.NodeIdentifier = Environment.GetEnvironmentVariable("POD_NAME")
+                                       ?? Environment.MachineName;
+        });
+
+        options
+            .UseEfCore(ef => ef.UseTickerQDbContext<AppDbContext>(o =>
+                o.UseSqlServer(connectionString)))
+            .AddStackExchangeRedis(redis =>
+            {
+                redis.Configuration = "redis:6379";
+                redis.NodeHeartbeatInterval = TimeSpan.FromMinutes(1);
+            });
+    });
+    ```
+  </Step>
+</Steps>
+
+### NodeHeartbeatInterval
+
+`NodeHeartbeatInterval` controls how often each node sends a heartbeat and checks for dead peers. The Redis TTL for each heartbeat key is automatically set to `NodeHeartbeatInterval + 20 seconds`, providing a grace window for transient delays.
+
+| Value | Trade-off |
+|---|---|
+| Short (e.g. 30 s) | Faster dead-node detection; slightly more Redis traffic |
+| Long (e.g. 5 min) | Fewer Redis calls; dead node resources locked longer |
+
+The default of **1 minute** suits most production workloads.
+
+## What happens when a node dies
+
+<Steps>
+  <Step title="Node stops sending heartbeats">
+    When a node crashes or is terminated, it stops writing its `hb:<node>` key. The key expires in Redis after `NodeHeartbeatInterval + 20 seconds`.
+  </Step>
+
+  <Step title="Surviving nodes detect the dead node">
+    On the next heartbeat tick, a surviving node reads the node registry, finds no heartbeat for the dead node, and removes it from the registry.
+  </Step>
+
+  <Step title="Resources are released">
+    The surviving node calls `ReleaseDeadNodeResources` for the dead node, which releases any job locks that node held. Those jobs return to a schedulable state and are picked up by surviving nodes on their next poll.
+  </Step>
+</Steps>
+
+<Note>
+Resource release happens on the **next heartbeat tick** of a surviving node, not instantly. During the window between node death and the next tick, the affected jobs remain locked. Size `NodeHeartbeatInterval` accordingly.
+</Note>
+
+## EF Core multi-node (no Redis)
+
+EF Core persistence uses **optimistic concurrency** (row-version / timestamp columns) to prevent two nodes from acquiring the same job. No Redis is required for correctness — only one node will win the database update race for any given job.
+
+Redis adds *active* dead-node cleanup on top of this. Without Redis, locks held by a dead node are released only when the EF Core fallback checker (`FallbackIntervalChecker`, default 30 s) detects them on startup or during periodic scans.
+
+```csharp Program.cs
+// EF Core only — no Redis — still safe for multi-node
+builder.Services.AddTickerQ<TimeTickerEntity, CronTickerEntity>(options =>
+{
+    options.ConfigureScheduler(scheduler =>
+    {
+        scheduler.NodeIdentifier = "worker-2";
+        scheduler.FallbackIntervalChecker = TimeSpan.FromSeconds(30);
+    });
+
+    options.UseEfCore(ef => ef.UseTickerQDbContext<AppDbContext>(o =>
+        o.UseSqlServer(connectionString)));
+});
+```
+
+## Recommended production setup
+
+<CardGroup cols={2}>
+  <Card title="Redis + EF Core" icon="layer-group">
+    Use Redis for active heartbeat coordination and dead-node cleanup. Use EF Core (SQL Server, PostgreSQL, etc.) for durable, queryable job storage. This is the most operationally robust combination.
+  </Card>
+  <Card title="EF Core only" icon="database">
+    Suitable when you cannot add Redis. Multi-node is safe via optimistic locking, but dead-node cleanup is slower and relies on the fallback checker interval.
+  </Card>
+</CardGroup>
+
+<Warning>
+**In-memory persistence does not support multi-node.** The in-memory store is process-local; two nodes using it share no state and will both execute every job. Only use in-memory persistence for local development with a single instance.
+</Warning>
+
+## Configuration reference
+
+<AccordionGroup>
+  <Accordion title="SchedulerOptionsBuilder properties">
+    | Property | Default | Description |
+    |---|---|---|
+    | `NodeIdentifier` | `Environment.MachineName` | Unique name for this node in the cluster |
+    | `MaxConcurrency` | `Environment.ProcessorCount` | Max parallel job executions per node |
+    | `FallbackIntervalChecker` | 30 seconds | How often the fallback scanner checks for stale locks |
+    | `MinPollingInterval` | 1 second | Minimum time between persistence polls |
+  </Accordion>
+
+  <Accordion title="TickerQRedisOptionBuilder properties">
+    | Property | Default | Description |
+    |---|---|---|
+    | `Configuration` | — | StackExchange.Redis connection string |
+    | `ConfigurationOptions` | — | `ConfigurationOptions` object (alternative to `Configuration`) |
+    | `NodeHeartbeatInterval` | 1 minute | How often nodes exchange heartbeats and check for dead peers |
+    | `InstanceName` | `"tickerq:"` | Redis key prefix |
+    | `JsonSerializerContext` | — | Source-generated context for AOT / trimming compatibility |
+  </Accordion>
+</AccordionGroup>

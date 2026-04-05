@@ -1,0 +1,237 @@
+---
+title: "Ticker Functions"
+description: "Methods decorated with [TickerFunction] that TickerQ discovers at compile time and registers as schedulable jobs."
+---
+
+A ticker function is an ordinary C# method decorated with `[TickerFunction]`. At compile time, TickerQ's Roslyn source generator scans your assembly for these methods and emits a static registration class — no reflection occurs at runtime.
+
+## How registration works
+
+The source generator (`TickerQIncrementalSourceGenerator`) runs during the build and produces a `TickerQInstanceFactoryExtensions` class in your root namespace. This class contains a `[ModuleInitializer]` that populates a static dictionary of `(functionName → delegate)` entries before `Main` runs. Every scheduled job is dispatched through that dictionary, which means zero runtime reflection.
+
+```csharp title="Generated code (simplified)"
+[ModuleInitializer]
+public static void Initialize()
+{
+    var tickerFunctionDelegateDict =
+        new Dictionary<string, (string, TickerTaskPriority, TickerFunctionDelegate, int)>(2);
+
+    // One entry per [TickerFunction] method in your assembly
+    tickerFunctionDelegateDict["SendWelcomeEmail"] = (...);
+
+    TickerFunctionProvider.RegisterFunctions(tickerFunctionDelegateDict, 2);
+    RegisterRequestTypes();
+}
+```
+
+## The `[TickerFunction]` attribute
+
+`TickerFunctionAttribute` targets methods and exposes two constructor signatures:
+
+```csharp title="TickerFunctionAttribute constructors"
+// Full signature — use when you also want to attach a cron schedule
+public TickerFunctionAttribute(
+    string functionName,
+    string cronExpression = null,
+    TickerTaskPriority taskPriority = TickerTaskPriority.Normal,
+    int maxConcurrency = 0)
+
+// Shorthand — use when there is no cron expression
+public TickerFunctionAttribute(
+    string functionName,
+    TickerTaskPriority taskPriority,
+    int maxConcurrency = 0)
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `functionName` | `string` | required | Unique identifier used when scheduling a job. Must be unique across the assembly. |
+| `cronExpression` | `string` | `null` | Optional cron expression. When set, TickerQ registers a recurring cron ticker for this function automatically on startup. |
+| `taskPriority` | `TickerTaskPriority` | `Normal` | Controls which scheduler queue the job is placed in. See [Task priority](#task-priority). |
+| `maxConcurrency` | `int` | `0` | Maximum simultaneous executions of this function. `0` means unlimited. |
+
+### Task priority
+
+| Value | Behavior |
+|---|---|
+| `TickerTaskPriority.LongRunning` | Runs on a dedicated thread using the default `TaskScheduler`. Use for CPU-bound or blocking work. |
+| `TickerTaskPriority.High` | Queued ahead of `Normal` and `Low` jobs in TickerQ's internal scheduler. |
+| `TickerTaskPriority.Normal` | Default. Runs after `High` priority jobs. |
+| `TickerTaskPriority.Low` | Runs last, after all higher-priority jobs are dispatched. |
+
+## Method signatures
+
+A ticker function must be an instance or static method on a non-nested class. The method may be synchronous or `async`, and may accept a `CancellationToken`.
+
+<Tabs>
+  <Tab title="Basic">
+    ```csharp title="Jobs.cs"
+    public class Jobs
+    {
+        [TickerFunction("CleanupTempFiles")]
+        public Task CleanupAsync(TickerFunctionContext context, CancellationToken cancellationToken)
+        {
+            // context.Id            — the ticker's Guid
+            // context.ScheduledFor  — UTC time this occurrence was due
+            // context.RetryCount    — how many times this has been retried
+            return Task.CompletedTask;
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Async">
+    ```csharp title="Jobs.cs"
+    public class Jobs
+    {
+        [TickerFunction("GenerateReport")]
+        public async Task GenerateReportAsync(
+            TickerFunctionContext context,
+            CancellationToken cancellationToken)
+        {
+            await Task.Delay(500, cancellationToken);
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="With cron expression">
+    ```csharp title="Jobs.cs"
+    public class Jobs
+    {
+        // Runs every day at 02:00 UTC
+        [TickerFunction("NightlyArchive", cronExpression: "0 2 * * *")]
+        public async Task ArchiveAsync(TickerFunctionContext context, CancellationToken cancellationToken)
+        {
+            await ArchiveOldRecordsAsync(cancellationToken);
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="With priority">
+    ```csharp title="Jobs.cs"
+    public class Jobs
+    {
+        [TickerFunction("CriticalPayment", taskPriority: TickerTaskPriority.High)]
+        public async Task ProcessPaymentAsync(TickerFunctionContext context, CancellationToken cancellationToken)
+        {
+            // Dispatched before Normal and Low jobs
+        }
+
+        [TickerFunction("DataExport", taskPriority: TickerTaskPriority.LongRunning, maxConcurrency: 1)]
+        public async Task ExportAsync(TickerFunctionContext context, CancellationToken cancellationToken)
+        {
+            // Runs on a dedicated thread; at most one instance at a time
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Dependency injection
+
+TickerQ resolves the class that contains a ticker function from the DI container before invoking the method. The source generator reads your constructor parameters and emits a factory method that calls `IServiceProvider.GetService<T>()` for each one.
+
+```csharp title="Jobs.cs — constructor injection"
+public class ReportJobs
+{
+    private readonly IReportService _reports;
+    private readonly ILogger<ReportJobs> _logger;
+
+    public ReportJobs(IReportService reports, ILogger<ReportJobs> logger)
+    {
+        _reports = reports;
+        _logger = logger;
+    }
+
+    [TickerFunction("WeeklyReport", cronExpression: "0 9 * * 1")]
+    public async Task SendWeeklyReportAsync(TickerFunctionContext context, CancellationToken cancellationToken)
+    {
+        var report = await _reports.BuildAsync(cancellationToken);
+        _logger.LogInformation("Report sent: {Id}", context.Id);
+    }
+}
+```
+
+You do not need to register the job class itself — TickerQ handles instantiation via the generated factory.
+
+### Keyed services
+
+Constructor parameters annotated with `[FromKeyedServices]` are resolved with `IServiceProvider.GetKeyedService<T>(key)`.
+
+```csharp title="Jobs.cs — keyed service"
+public class NotificationJobs
+{
+    private readonly INotifier _smsNotifier;
+
+    public NotificationJobs(
+        [FromKeyedServices("sms")] INotifier smsNotifier)
+    {
+        _smsNotifier = smsNotifier;
+    }
+
+    [TickerFunction("SmsBroadcast")]
+    public Task SendAsync(TickerFunctionContext context, CancellationToken cancellationToken)
+        => _smsNotifier.SendAsync(cancellationToken);
+}
+```
+
+## `[TickerQConstructor]` — choosing a constructor
+
+When a class has multiple constructors, TickerQ uses the first `public` constructor by default. Decorate the constructor you want TickerQ to use with `[TickerQConstructor]`.
+
+```csharp title="Jobs.cs — multiple constructors"
+public class AnalyticsJobs
+{
+    private readonly IAnalyticsService _analytics;
+
+    public AnalyticsJobs() { }
+
+    [TickerQConstructor]
+    public AnalyticsJobs(IAnalyticsService analytics)
+    {
+        _analytics = analytics;
+    }
+
+    [TickerFunction("TrackUsage")]
+    public Task TrackAsync(TickerFunctionContext context, CancellationToken cancellationToken)
+        => _analytics.TrackAsync(cancellationToken);
+}
+```
+
+<Note>
+  Only one constructor per class may carry `[TickerQConstructor]`. A compile-time diagnostic is emitted if more than one is found.
+</Note>
+
+## Static classes
+
+Ticker functions can live in a static class. Because a static class cannot be instantiated, TickerQ skips constructor generation entirely — services must be obtained through the context's service scope if needed.
+
+```csharp title="Jobs.cs — static class"
+public static class HealthJobs
+{
+    [TickerFunction("Ping", cronExpression: "* * * * *")]
+    public static Task PingAsync(TickerFunctionContext context, CancellationToken cancellationToken)
+    {
+        Console.WriteLine($"Ping at {context.ScheduledFor:O}");
+        return Task.CompletedTask;
+    }
+}
+```
+
+## Compile-time validation
+
+The source generator performs the following checks and emits errors or warnings when violations are detected:
+
+<AccordionGroup>
+  <Accordion title="Unique function names">
+    Each `functionName` must be unique within the assembly. Duplicate names produce a compile error.
+  </Accordion>
+  <Accordion title="Valid method parameters">
+    Methods may only accept `TickerFunctionContext` (or its generic variant `TickerFunctionContext<TRequest>`) and/or `CancellationToken`. Additional parameters cause a diagnostic.
+  </Accordion>
+  <Accordion title="Non-nested class requirement">
+    Ticker functions must be declared on top-level (non-nested) classes. Nested classes are rejected at compile time.
+  </Accordion>
+  <Accordion title="Single [TickerQConstructor] per class">
+    If more than one constructor is marked `[TickerQConstructor]`, the generator emits an error.
+  </Accordion>
+</AccordionGroup>

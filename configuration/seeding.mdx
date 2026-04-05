@@ -1,0 +1,217 @@
+---
+title: "Seeding Jobs on Startup"
+description: "Pre-populate time tickers and cron tickers when your application starts."
+---
+
+Seeders let you guarantee that specific jobs exist in the persistence layer every time your application starts. This is useful for ensuring recurring maintenance tasks, scheduled reports, or other production-critical jobs are always registered, even after a fresh deployment or database reset.
+
+## When seeders run
+
+Seeders execute inside `TickerQInitializerHostedService`, which is an `IHostedService` that runs after the persistence layer is ready. This means:
+
+- Seeders execute **after** `UseTickerQ()` is called on the host.
+- Seeders run **before** the scheduler starts processing jobs.
+- Seeders have access to the full `IServiceProvider`, including `ITimeTickerManager` and `ICronTickerManager`.
+
+<Note>
+  Design-time tools such as the EF Core migration CLI build the host without starting it, so seeders are never invoked during migrations.
+</Note>
+
+## Seeding time tickers
+
+Use `UseTickerSeeder()` with an `ITimeTickerManager<TTimeTicker>` delegate to schedule one-off or fixed-time jobs at startup:
+
+<CodeGroup>
+
+```csharp Program.cs — seed a time ticker
+builder.Services.AddTickerQ(options =>
+{
+    options.AddOperationalStore(/* ... */);
+
+    options.UseTickerSeeder(async (ITimeTickerManager<TimeTickerEntity> manager) =>
+    {
+        // Only add if not already scheduled
+        var existing = await manager.GetByFunctionAsync("DailyReport");
+        if (existing == null)
+        {
+            await manager.AddAsync(new TimeTickerEntity
+            {
+                Function      = "DailyReport",
+                ExecutionTime = DateTime.UtcNow.AddHours(1)
+            });
+        }
+    });
+});
+```
+
+</CodeGroup>
+
+## Seeding cron tickers
+
+Use `UseTickerSeeder()` with an `ICronTickerManager<TCronTicker>` delegate to register recurring cron jobs:
+
+<CodeGroup>
+
+```csharp Program.cs — seed a cron ticker
+builder.Services.AddTickerQ(options =>
+{
+    options.AddOperationalStore(/* ... */);
+
+    options.UseTickerSeeder(async (ICronTickerManager<CronTickerEntity> manager) =>
+    {
+        var existing = await manager.GetByFunctionAsync("NightlyCleanup");
+        if (existing == null)
+        {
+            await manager.AddAsync(new CronTickerEntity
+            {
+                Function       = "NightlyCleanup",
+                CronExpression = "0 2 * * *"   // every day at 02:00 UTC
+            });
+        }
+    });
+});
+```
+
+</CodeGroup>
+
+## Seeding both time and cron tickers together
+
+Pass both delegates to the combined `UseTickerSeeder()` overload to configure time and cron seeders in a single call:
+
+<CodeGroup>
+
+```csharp Program.cs — seed time and cron tickers together
+builder.Services.AddTickerQ(options =>
+{
+    options.AddOperationalStore(/* ... */);
+
+    options.UseTickerSeeder(
+        timeSeeder: async (ITimeTickerManager<TimeTickerEntity> timeManager) =>
+        {
+            var existing = await timeManager.GetByFunctionAsync("WarmupCache");
+            if (existing == null)
+            {
+                await timeManager.AddAsync(new TimeTickerEntity
+                {
+                    Function      = "WarmupCache",
+                    ExecutionTime = DateTime.UtcNow.AddSeconds(30)
+                });
+            }
+        },
+        cronSeeder: async (ICronTickerManager<CronTickerEntity> cronManager) =>
+        {
+            var existing = await cronManager.GetByFunctionAsync("NightlyCleanup");
+            if (existing == null)
+            {
+                await cronManager.AddAsync(new CronTickerEntity
+                {
+                    Function       = "NightlyCleanup",
+                    CronExpression = "0 2 * * *"
+                });
+            }
+        });
+});
+```
+
+</CodeGroup>
+
+## Using custom entity types
+
+If your project defines custom entity types that extend `TimeTickerEntity` or `CronTickerEntity`, replace the generic parameters and pass your derived types:
+
+<CodeGroup>
+
+```csharp Entities/AppTimeTicker.cs
+using TickerQ.Utilities.Entities;
+
+public class AppTimeTicker : TimeTickerEntity<AppTimeTicker>
+{
+    public string TenantId { get; set; }
+}
+```
+
+```csharp Entities/AppCronTicker.cs
+using TickerQ.Utilities.Entities;
+
+public class AppCronTicker : CronTickerEntity
+{
+    public string Owner { get; set; }
+}
+```
+
+```csharp Program.cs — seeding custom entity types
+builder.Services.AddTickerQ<AppTimeTicker, AppCronTicker>(options =>
+{
+    options.AddOperationalStore(/* ... */);
+
+    options.UseTickerSeeder(
+        timeSeeder: async (ITimeTickerManager<AppTimeTicker> manager) =>
+        {
+            await manager.AddAsync(new AppTimeTicker
+            {
+                Function      = "TenantSync",
+                ExecutionTime = DateTime.UtcNow.AddMinutes(5),
+                TenantId      = "tenant-001"
+            });
+        },
+        cronSeeder: async (ICronTickerManager<AppCronTicker> manager) =>
+        {
+            await manager.AddAsync(new AppCronTicker
+            {
+                Function       = "OwnerReport",
+                CronExpression = "0 9 * * 1",  // every Monday at 09:00
+                Owner          = "finance-team"
+            });
+        });
+});
+```
+
+</CodeGroup>
+
+## Disabling auto-seeding of code-defined cron tickers
+
+By default, any method decorated with `[TickerFunction("name", cronExpression: "...")]` is automatically seeded into the cron ticker store on startup. To opt out of this behavior — for example, when you want full control over which cron jobs are active in a given environment — call `IgnoreSeedDefinedCronTickers()`:
+
+<CodeGroup>
+
+```csharp Program.cs
+builder.Services.AddTickerQ(options =>
+{
+    options.AddOperationalStore(/* ... */);
+
+    // Suppress automatic seeding of [TickerFunction] cron attributes.
+    // Only seeders you configure explicitly via UseTickerSeeder() will run.
+    options.IgnoreSeedDefinedCronTickers();
+});
+```
+
+</CodeGroup>
+
+<Warning>
+  When `IgnoreSeedDefinedCronTickers()` is active, cron jobs defined in code with a `cronExpression` parameter are not seeded automatically. You must add them manually through a `UseTickerSeeder()` delegate or via the dashboard if you want them to run.
+</Warning>
+
+## Recommended pattern for production
+
+Use seeders as a safety net rather than the primary job creation mechanism. Check for existing records before inserting to make seeders idempotent:
+
+<CodeGroup>
+
+```csharp Program.cs — idempotent production seeder
+options.UseTickerSeeder(async (ICronTickerManager<CronTickerEntity> manager) =>
+{
+    const string function = "MonthlyInvoicing";
+
+    var existing = await manager.GetByFunctionAsync(function);
+    if (existing != null)
+        return; // Already seeded — nothing to do.
+
+    await manager.AddAsync(new CronTickerEntity
+    {
+        Function       = function,
+        CronExpression = "0 0 1 * *"  // first day of every month at midnight
+    });
+});
+```
+
+</CodeGroup>

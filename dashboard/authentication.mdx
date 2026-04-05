@@ -1,0 +1,185 @@
+---
+title: "Dashboard Authentication"
+description: "Secure the TickerQ dashboard with built-in authentication modes including Basic Auth, API key, host authentication, and custom validators."
+---
+
+The TickerQ dashboard supports five authentication modes. Choose the one that fits your application's security model and configure it on `DashboardOptionsBuilder` inside `AddDashboard()`.
+
+<Warning>
+Always protect the dashboard in production. The dashboard exposes job management controls including the ability to stop and restart the scheduler host. Running it without authentication in a publicly reachable environment is a security risk.
+</Warning>
+
+## Default behavior
+
+If you call `AddDashboard()` without configuring any authentication mode, the dashboard is **public** — all requests are accepted without any credential check. This is equivalent to calling `WithNoAuth()` explicitly.
+
+## Authentication modes
+
+<Tabs>
+  <Tab title="No auth">
+
+### WithNoAuth()
+
+Disables authentication entirely. All visitors can access the dashboard and its API.
+
+```csharp Program.cs
+.AddDashboard(dashboard =>
+{
+    dashboard.WithNoAuth();
+});
+```
+
+<Warning>
+Only use `WithNoAuth()` in local development. Never deploy a public dashboard to production.
+</Warning>
+
+  </Tab>
+  <Tab title="Basic auth">
+
+### WithBasicAuth(username, password)
+
+Enables HTTP Basic authentication. The dashboard prompts for a username and password, then validates them against the configured credentials.
+
+```csharp Program.cs
+.AddDashboard(dashboard =>
+{
+    dashboard.WithBasicAuth("admin", "s3cr3t-p@ssword");
+});
+```
+
+Credentials are Base64-encoded internally and compared against the `Authorization: Basic <token>` header on each API request.
+
+  </Tab>
+  <Tab title="API key">
+
+### WithApiKey(apiKey)
+
+Protects the dashboard with a static API key sent as a Bearer token.
+
+```csharp Program.cs
+.AddDashboard(dashboard =>
+{
+    dashboard.WithApiKey("my-secret-api-key-here");
+});
+```
+
+The dashboard frontend sends the key as `Authorization: Bearer <key>`. The middleware also accepts the key as a raw token or via an `access_token` query parameter (used by the SignalR WebSocket connection).
+
+  </Tab>
+  <Tab title="Host auth">
+
+### WithHostAuthentication(policy?)
+
+Delegates authentication to your application's existing ASP.NET Core authentication and authorization stack. Use this when you already have authentication middleware configured (e.g., cookie auth, JWT bearer, OpenID Connect).
+
+```csharp Program.cs
+// Minimal — requires any authenticated user
+.AddDashboard(dashboard =>
+{
+    dashboard.WithHostAuthentication();
+});
+```
+
+```csharp Program.cs
+// With a named policy — requires a specific authorization policy
+.AddDashboard(dashboard =>
+{
+    dashboard.WithHostAuthentication("AdminPolicy");
+});
+```
+
+When a policy name is provided, the dashboard calls `IAuthorizationService.AuthorizeAsync` with that policy on every API request. Without a policy name, the dashboard checks `HttpContext.User.Identity.IsAuthenticated`.
+
+<Tip>
+`WithHostAuthentication()` is the recommended choice when your application already has authentication configured. It avoids maintaining a second set of credentials and automatically inherits any session or token expiry from your existing auth setup.
+</Tip>
+
+  </Tab>
+  <Tab title="Custom auth">
+
+### WithCustomAuth(Func&lt;string, bool&gt;)
+
+Validates requests using your own logic. The function receives the raw value of the `Authorization` header (or `access_token` query parameter) and returns `true` to allow access or `false` to deny it.
+
+```csharp Program.cs
+.AddDashboard(dashboard =>
+{
+    dashboard.WithCustomAuth(token =>
+    {
+        // Validate against your own store
+        return token == Environment.GetEnvironmentVariable("DASHBOARD_SECRET");
+    });
+});
+```
+
+You can also resolve dependencies at startup and close over them:
+
+```csharp Program.cs
+var validTokens = new HashSet<string> { "token-a", "token-b" };
+
+.AddDashboard(dashboard =>
+{
+    dashboard.WithCustomAuth(token => validTokens.Contains(token));
+});
+```
+
+  </Tab>
+</Tabs>
+
+## Session timeout
+
+Use `WithSessionTimeout(minutes)` to control how long the dashboard's client-side session remains valid before the user must re-authenticate. The default is **60 minutes**.
+
+```csharp Program.cs
+.AddDashboard(dashboard =>
+{
+    dashboard
+        .WithBasicAuth("admin", "s3cr3t")
+        .WithSessionTimeout(30);  // 30-minute session
+});
+```
+
+`WithSessionTimeout` can be chained with any authentication mode.
+
+## How authentication is enforced
+
+Authentication applies to all routes under `/api/` inside the dashboard's middleware branch. Static assets (JS, CSS, images) and the SignalR negotiate endpoint are intentionally excluded — the browser must load these before the user can log in.
+
+The SignalR hub (`/ticker-notification-hub`) authenticates the WebSocket connection in `OnConnectedAsync`. If authentication fails, the connection is aborted immediately.
+
+## Complete example
+
+```csharp Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+// Configure your application's auth (required for WithHostAuthentication)
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options => { /* ... */ });
+
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("AdminPolicy", policy =>
+        policy.RequireRole("Admin"));
+});
+
+builder.Services.AddTickerQ(options => { /* ... */ })
+    .UseEntityFrameworkStore<AppDbContext>()
+    .AddDashboard(dashboard =>
+    {
+        dashboard
+            .WithHostAuthentication("AdminPolicy")
+            .WithSessionTimeout(60);
+    });
+
+var app = builder.Build();
+
+app.UseAuthentication();
+app.UseAuthorization();
+app.UseTickerQ();
+app.Run();
+```
+
+<Note>
+When using `WithHostAuthentication()`, ensure `app.UseAuthentication()` and `app.UseAuthorization()` are called before `app.UseTickerQ()` in the middleware pipeline.
+</Note>

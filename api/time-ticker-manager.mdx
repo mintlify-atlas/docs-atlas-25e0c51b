@@ -1,0 +1,298 @@
+---
+title: "ITimeTickerManager"
+description: "Manage one-time scheduled jobs programmatically using the ITimeTickerManager interface."
+---
+
+`ITimeTickerManager<TTimeTicker>` is the primary interface for creating, updating, and deleting time-based (one-shot) scheduled jobs at runtime.
+
+**Type constraint:** `TTimeTicker : TimeTickerEntity<TTimeTicker>`
+
+Inject it using the default entity type or your own custom entity that extends `TimeTickerEntity`.
+
+```csharp constructor injection
+public class MyService
+{
+    private readonly ITimeTickerManager<TimeTickerEntity> _manager;
+
+    public MyService(ITimeTickerManager<TimeTickerEntity> manager)
+    {
+        _manager = manager;
+    }
+}
+```
+
+```csharp minimal API
+app.MapPost("/schedule", async (ITimeTickerManager<TimeTickerEntity> manager) =>
+{
+    var result = await manager.AddAsync(new TimeTickerEntity
+    {
+        Function = "send-email",
+        ExecutionTime = DateTime.UtcNow.AddMinutes(5)
+    });
+
+    return result.IsSucceeded ? Results.Ok(result.Result) : Results.Problem();
+});
+```
+
+---
+
+## Methods
+
+### `AddAsync`
+
+Schedules a single time ticker for future execution.
+
+```csharp
+Task<TickerResult<TTimeTicker>> AddAsync(
+    TTimeTicker entity,
+    CancellationToken cancellationToken = default
+)
+```
+
+<ParamField body="entity" type="TTimeTicker" required>
+  The time ticker entity to persist. Set at minimum `Function` and `ExecutionTime`.
+</ParamField>
+
+<ParamField body="cancellationToken" type="CancellationToken" default="default">
+  Token to cancel the operation.
+</ParamField>
+
+```csharp AddAsync example
+var ticker = new TimeTickerEntity
+{
+    Function = "generate-report",
+    ExecutionTime = DateTime.UtcNow.AddHours(1),
+    Retries = 3,
+    RetryIntervals = new[] { 30, 60, 120 } // seconds between retries
+};
+
+var result = await _manager.AddAsync(ticker);
+
+if (result.IsSucceeded)
+{
+    Console.WriteLine($"Scheduled job ID: {result.Result.Id}");
+}
+else
+{
+    Console.WriteLine($"Failed: {result.Exception?.Message}");
+}
+```
+
+---
+
+### `UpdateAsync`
+
+Updates an existing time ticker. The entity must already exist in the database.
+
+```csharp
+Task<TickerResult<TTimeTicker>> UpdateAsync(
+    TTimeTicker timeTicker,
+    CancellationToken cancellationToken = default
+)
+```
+
+<ParamField body="timeTicker" type="TTimeTicker" required>
+  The time ticker entity with updated values. Must have a valid `Id`.
+</ParamField>
+
+<ParamField body="cancellationToken" type="CancellationToken" default="default">
+  Token to cancel the operation.
+</ParamField>
+
+```csharp UpdateAsync example
+// Fetch existing ticker, then modify and update
+ticker.ExecutionTime = DateTime.UtcNow.AddHours(2);
+ticker.Retries = 5;
+
+var result = await _manager.UpdateAsync(ticker);
+
+if (result.IsSucceeded)
+{
+    Console.WriteLine($"Updated: {result.Result.Id}");
+}
+```
+
+---
+
+### `DeleteAsync`
+
+Deletes a single time ticker by its ID.
+
+```csharp
+Task<TickerResult<TTimeTicker>> DeleteAsync(
+    Guid id,
+    CancellationToken cancellationToken = default
+)
+```
+
+<ParamField body="id" type="Guid" required>
+  The ID of the time ticker to delete.
+</ParamField>
+
+<ParamField body="cancellationToken" type="CancellationToken" default="default">
+  Token to cancel the operation.
+</ParamField>
+
+```csharp DeleteAsync example
+var result = await _manager.DeleteAsync(tickerId);
+
+if (result.IsSucceeded)
+{
+    Console.WriteLine($"Deleted rows: {result.AffectedRows}");
+}
+```
+
+---
+
+### `AddBatchAsync`
+
+Schedules multiple time tickers in a single operation.
+
+```csharp
+Task<TickerResult<List<TTimeTicker>>> AddBatchAsync(
+    List<TTimeTicker> entities,
+    CancellationToken cancellationToken = default
+)
+```
+
+<ParamField body="entities" type="List<TTimeTicker>" required>
+  List of time ticker entities to insert.
+</ParamField>
+
+<ParamField body="cancellationToken" type="CancellationToken" default="default">
+  Token to cancel the operation.
+</ParamField>
+
+```csharp AddBatchAsync example
+var tickers = new List<TimeTickerEntity>
+{
+    new TimeTickerEntity
+    {
+        Function = "send-newsletter",
+        ExecutionTime = DateTime.UtcNow.AddMinutes(10)
+    },
+    new TimeTickerEntity
+    {
+        Function = "send-newsletter",
+        ExecutionTime = DateTime.UtcNow.AddMinutes(20)
+    },
+    new TimeTickerEntity
+    {
+        Function = "send-newsletter",
+        ExecutionTime = DateTime.UtcNow.AddMinutes(30)
+    }
+};
+
+var result = await _manager.AddBatchAsync(tickers);
+
+if (result.IsSucceeded)
+{
+    Console.WriteLine($"Scheduled {result.Result.Count} jobs");
+}
+```
+
+---
+
+### `UpdateBatchAsync`
+
+Updates multiple time tickers in a single operation.
+
+```csharp
+Task<TickerResult<List<TTimeTicker>>> UpdateBatchAsync(
+    List<TTimeTicker> timeTickers,
+    CancellationToken cancellationToken = default
+)
+```
+
+<ParamField body="timeTickers" type="List<TTimeTicker>" required>
+  List of time ticker entities with updated values. Each must have a valid `Id`.
+</ParamField>
+
+<ParamField body="cancellationToken" type="CancellationToken" default="default">
+  Token to cancel the operation.
+</ParamField>
+
+```csharp UpdateBatchAsync example
+// Reschedule all tickers by pushing their execution time back 1 hour
+foreach (var t in existingTickers)
+{
+    t.ExecutionTime = t.ExecutionTime?.AddHours(1);
+}
+
+var result = await _manager.UpdateBatchAsync(existingTickers);
+
+if (result.IsSucceeded)
+{
+    Console.WriteLine($"Updated {result.AffectedRows} rows");
+}
+```
+
+---
+
+### `DeleteBatchAsync`
+
+Deletes multiple time tickers by their IDs.
+
+```csharp
+Task<TickerResult<TTimeTicker>> DeleteBatchAsync(
+    List<Guid> ids,
+    CancellationToken cancellationToken = default
+)
+```
+
+<ParamField body="ids" type="List<Guid>" required>
+  List of time ticker IDs to delete.
+</ParamField>
+
+<ParamField body="cancellationToken" type="CancellationToken" default="default">
+  Token to cancel the operation.
+</ParamField>
+
+```csharp DeleteBatchAsync example
+var ids = existingTickers.Select(t => t.Id).ToList();
+
+var result = await _manager.DeleteBatchAsync(ids);
+
+if (result.IsSucceeded)
+{
+    Console.WriteLine($"Deleted {result.AffectedRows} tickers");
+}
+```
+
+---
+
+## TickerResult\<T\>
+
+All methods return a `TickerResult<T>`. Its fields are read-only and set internally by TickerQ.
+
+<ResponseField name="IsSucceeded" type="bool" required>
+  `true` if the operation completed without error; `false` otherwise.
+</ResponseField>
+
+<ResponseField name="Result" type="T">
+  The persisted entity or list of entities returned after the operation. `null` on failure.
+</ResponseField>
+
+<ResponseField name="AffectedRows" type="int">
+  Number of database rows affected by the operation.
+</ResponseField>
+
+<ResponseField name="Exception" type="Exception">
+  The exception thrown during the operation, if any. `null` on success.
+</ResponseField>
+
+```csharp Handling TickerResult
+var result = await _manager.AddAsync(ticker);
+
+if (!result.IsSucceeded)
+{
+    logger.LogError(result.Exception, "Failed to schedule ticker");
+    return;
+}
+
+logger.LogInformation(
+    "Ticker {Id} scheduled. Affected rows: {Rows}",
+    result.Result.Id,
+    result.AffectedRows
+);
+```
